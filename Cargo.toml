@@ -1,0 +1,97 @@
+[package]
+name = "rysteria"
+version = "2.7.1"
+edition = "2024"
+build = "build.rs"
+
+[[bin]]
+name = "rysteria"
+path = "src/main.rs"
+
+[lib]
+name = "rysteria"
+path = "src/lib.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.49", features = ["full"] }
+
+# QUIC + TLS
+quinn = { version = "0.11", default-features = false, features = ["rustls-aws-lc-rs", "runtime-tokio"] }
+quinn-proto = { version = "0.11", default-features = false, features = ["rustls-aws-lc-rs"] }
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "logging", "prefer-post-quantum", "std", "tls12"] }
+aws-lc-rs = { version = "1" }
+
+# HTTP/3
+h3 = { version = "0.0.8" }
+h3-quinn = { version = "0.0.10" }
+
+# Config parsing
+serde = { version = "1", features = ["derive"] }
+serde-saphyr = { version = "0.0.21" }
+serde_json = { version = "1" }
+url = { version = "2" }
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Logging
+tracing = { version = "0.1" }
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+
+# Crypto (Salamander obfuscation)
+blake2 = { version = "0.10" }
+sha2 = { version = "0.10" }
+rand = { version = "0.10" }
+
+# Error handling
+thiserror = { version = "2" }
+
+# HTTP types (used by h3 client/server for request/response building)
+http = { version = "1" }
+
+# Byte buffers
+bytes = { version = "1" }
+tokio-util = { version = "0.7" }
+futures-util = { version = "0.3" }
+regex = { version = "1" }
+geoip2 = { version = "0.1.8" }
+prost = { version = "0.14" }
+
+# Misc
+base64 = { version = "0.22" }
+once_cell = { version = "1" }
+libc = { version = "0.2" }
+time = { version = "0.3", features = ["formatting"] }
+tun-rs = { version = "2", features = ["async"] }
+netstack-smoltcp = { version = "0.2" }
+
+# Async trait support (for Authenticator)
+async-trait = { version = "0.1" }
+
+# HTTP client for HTTP authenticator
+reqwest = { version = "0.13", default-features = true, features = ["json"] }
+hickory-resolver = { version = "0.25", default-features = false, features = ["tokio", "tls-aws-lc-rs", "https-aws-lc-rs", "webpki-roots"] }
+
+# HTTP/1.1 + HTTP/2 for masquerade TCP servers (Phase 5+)
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = { version = "0.1" }
+tokio-rustls = { version = "0.26" }
+rustls-pemfile = { version = "2" }
+webpki-roots = { version = "0.26" }
+webpki = { package = "rustls-webpki", version = "0.103" }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["fs"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+hex = { version = "0.4" }
+rcgen = { version = "0.14" }
+
+[profile.release]
+# Strip symbol tables from the release binary.
+# Source paths in panic messages are handled separately via --remap-path-prefix
+# in hyperbole.py so that panic locations remain readable (e.g. "src/foo.rs")
+# without leaking the build machine's absolute paths.
+strip = "symbols"

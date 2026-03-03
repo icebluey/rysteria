@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── Build: Linux / Windows / Android / FreeBSD ───────────────────────────
+  # Linux targets  : cargo-zigbuild + zig (no Docker, no glibc version conflicts)
+  # Windows targets: cargo-xwin (MSVC toolchain via xwin)
+  # darwin/*       : excluded — Apple SDK cannot be cross-compiled from Linux
+  build-cross:
+    name: Build (Linux / Windows / Android / FreeBSD)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # cargo-zigbuild needs the Rust std for each Linux target installed via rustup.
+      # cargo-xwin needs the Rust std for each Windows MSVC target.
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: >-
+            x86_64-pc-windows-msvc,
+            x86_64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@v2
+
+      # NASM is required by aws-lc-sys to assemble BoringSSL/AWS-LC hand-written
+      # assembly when targeting Windows (x86_64-pc-windows-msvc).
+      - name: Install NASM
+        run: sudo apt-get install -y nasm
+
+      # Zig is required by cargo-zigbuild as the C cross-compiler for Linux targets.
+      - name: Install Zig
+        uses: goto-bus-stop/setup-zig@v2
+
+      - name: Install cargo-zigbuild and cargo-xwin
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild,cargo-xwin
+
+      - name: Build
+        env:
+          RY_APP_PLATFORMS: all
+        run: >-
+          python3 hyperbole.py build
+          --os linux,windows
+
+  # ── Build: macOS ──────────────────────────────────────────────────────────
+  # Must run on a macOS host; Apple's SDK is not redistributable for
+  # cross-compilation from Linux.
+  # macos-latest is arm64 (M1); x86_64-apple-darwin is a cross-compile target.
+  build-macos:
+    name: Build (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        env:
+          RY_APP_PLATFORMS: all
+        run: python3 hyperbole.py build --os darwin
+
+

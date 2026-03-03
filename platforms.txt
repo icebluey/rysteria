@@ -1,0 +1,20 @@
+# This file controls what platform/architecture combinations to build for a release.
+# Syntax: os/arch  (one per line, lines starting with # are comments)
+# See hyperbole.py PLATFORM_MAP for the full list of supported platforms.
+
+# Windows
+windows/amd64
+windows/amd64-avx
+
+# macOS
+darwin/amd64
+darwin/amd64-avx
+darwin/arm64
+
+# Linux (musl, statically linked)
+linux/amd64-musl
+linux/amd64-avx-musl
+
+# Linux (gnu, dynamically linked)
+linux/amd64
+linux/amd64-avx
