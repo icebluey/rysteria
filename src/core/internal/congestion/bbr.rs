@@ -3,7 +3,7 @@
 /// Uses quinn's built-in BBR controller. The Go implementation has a full
 /// BBR implementation, but for Rysteria we delegate to quinn's native BBR.
 ///
-/// Phase 2+: BBR is wired into the QUIC connection via TransportConfig.
+/// BBR is wired into the QUIC connection via TransportConfig.
 use quinn_proto::congestion::{BbrConfig, ControllerFactory};
 use std::sync::Arc;
 

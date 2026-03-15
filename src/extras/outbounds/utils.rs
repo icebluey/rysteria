@@ -322,7 +322,37 @@ impl DirectOutbound {
             TcpSocket::new_v6()?
         };
         self.configure_tcp_socket(&socket, addr)?;
-        socket.connect(addr).await
+        let stream = socket.connect(addr).await?;
+
+        // apply socket policy for latency and dead-peer detection.
+        //
+        // TCP_NODELAY: disable Nagle's algorithm so small proxy writes are sent
+        // immediately. Proxy traffic is latency-sensitive; coalescing adds RTTs.
+        //
+        // SO_KEEPALIVE + TCP_KEEPIDLE/INTVL/CNT: detect dead peers and reclaim
+        // resources. Without keepalive, a silently dead client holds the server
+        // socket open until the idle timeout fires (which may be minutes).
+        //
+        // Best-effort: ignore errors — the connection is still usable without
+        // these options, and some environments restrict setsockopt calls.
+        let _ = stream.set_nodelay(true);
+        {
+            use socket2::{SockRef, TcpKeepalive};
+            use std::time::Duration;
+
+            let sock = SockRef::from(&stream);
+            let ka = TcpKeepalive::new()
+                // Start probing after 60 s of inactivity.
+                .with_time(Duration::from_secs(60));
+            // Linux/Android support per-socket keepalive interval and retry count.
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            let ka = ka
+                .with_interval(Duration::from_secs(10))
+                .with_retries(3);
+            let _ = sock.set_tcp_keepalive(&ka);
+        }
+
+        Ok(stream)
     }
 
     async fn dial_dual_stack(

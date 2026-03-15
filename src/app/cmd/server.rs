@@ -524,6 +524,7 @@ pub async fn run_server(config_path: Option<PathBuf>) -> Result<(), BoxError> {
         udp_idle_timeout,
         obfs_salamander_password,
         tls_client_ca,
+        shard_threads: None,
     })?;
 
     if let Some(base) = base_masq_handler {

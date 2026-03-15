@@ -1,4 +1,3 @@
-// TODO: Phase 4+ - Internal app modules
 pub mod forwarding;
 pub mod http;
 pub mod proxymux;

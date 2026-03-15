@@ -584,6 +584,9 @@ fn build_client_config(cfg: &Arc<ClientConfigFile>) -> Result<ClientConfig, BoxE
         packet_transport: resolved_server.packet_transport,
         obfs,
         fast_open: effective.fast_open,
+        persistent_tunnel: true,
+        tunnel_keepalive_secs: 25,
+        conn_send_budget: None,
     })
 }
 

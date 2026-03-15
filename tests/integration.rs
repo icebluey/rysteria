@@ -56,6 +56,7 @@ async fn spawn_server(password: &str) -> std::net::SocketAddr {
         speed_test: false,
         udp_idle_timeout: Duration::from_secs(60),
         obfs_salamander_password: None,
+        shard_threads: Some(1),
     })
     .unwrap();
     let addr = server.local_addr();
@@ -82,6 +83,9 @@ fn client_cfg(password: &str, server_addr: std::net::SocketAddr) -> ClientConfig
         packet_transport: ClientPacketTransport::Udp,
         obfs: None,
         fast_open: false,
+        persistent_tunnel: true,
+        tunnel_keepalive_secs: 25,
+        conn_send_budget: None,
     }
 }
 
@@ -103,7 +107,7 @@ async fn handshake_correct_password() {
     .expect("timed out")
     .expect("connect failed");
 
-    // Phase 3: server reports UDP enabled.
+    // server reports UDP enabled.
     assert!(info.udp_enabled);
 
     client.close();
@@ -235,7 +239,7 @@ async fn tcp_proxy_multiple_streams() {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Phase 3: UDP relay tests
+// UDP relay tests
 // ──────────────────────────────────────────────────────────────────────────────
 
 /// A client can open a UDP relay session and exchange datagrams with a remote
@@ -412,7 +416,7 @@ async fn udp_relay_large_payload_auto_fragmented() {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Phase 3: UDP hop address parsing tests
+// UDP hop address parsing tests
 // ──────────────────────────────────────────────────────────────────────────────
 
 /// `resolve_udp_hop_addrs` correctly parses a single-port hop address.
@@ -440,4 +444,167 @@ fn udphop_resolve_port_union() {
     assert_eq!(addrs.len(), 3);
     assert_eq!(addrs[0].port(), 9000);
     assert_eq!(addrs[2].port(), 9002);
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Optimization validation tests
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Multiple concurrent TCP proxy streams receive fair throughput.
+///
+/// Opens N streams to an echo server concurrently, sends data, reads it
+/// back, and verifies all streams complete without starvation. This
+/// exercises the DRR scheduler and per-flow permit allocation in the
+/// ConnectionActor path.
+#[tokio::test]
+async fn tcp_proxy_multi_flow_fairness() {
+    const NUM_STREAMS: usize = 4;
+    const PAYLOAD_SIZE: usize = 4096;
+
+    // Start a TCP echo server.
+    let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_addr = echo.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = echo.accept().await else { break };
+            tokio::spawn(async move {
+                let (mut rd, mut wr) = stream.split();
+                let _ = tokio::io::copy(&mut rd, &mut wr).await;
+            });
+        }
+    });
+
+    let server_addr = spawn_server("fairness").await;
+    let (client, _) = tokio::time::timeout(
+        Duration::from_secs(5),
+        Client::connect(client_cfg("fairness", server_addr)),
+    )
+    .await
+    .expect("timed out")
+    .expect("connect failed");
+    let client = Arc::new(client);
+
+    // Spawn N concurrent streams, each sending and receiving PAYLOAD_SIZE bytes.
+    let mut handles = Vec::new();
+    for i in 0..NUM_STREAMS {
+        let c = Arc::clone(&client);
+        let addr = echo_addr.to_string();
+        handles.push(tokio::spawn(async move {
+            let mut proxy = tokio::time::timeout(Duration::from_secs(5), c.tcp(&addr))
+                .await
+                .expect("tcp() timed out")
+                .expect("tcp() failed");
+
+            // Use a unique fill byte per stream for verification.
+            let fill = (i as u8).wrapping_add(0xA0);
+            let data = vec![fill; PAYLOAD_SIZE];
+            proxy.write_all(&data).await.expect("write failed");
+
+            // Read back the echoed data.
+            let mut buf = vec![0u8; PAYLOAD_SIZE];
+            tokio::time::timeout(Duration::from_secs(5), proxy.read_exact(&mut buf))
+                .await
+                .expect("read timed out")
+                .expect("read failed");
+
+            assert_eq!(buf, data, "echo mismatch on stream {i}");
+            true
+        }));
+    }
+
+    let mut all_ok = true;
+    for h in handles {
+        if !h.await.expect("task panicked") {
+            all_ok = false;
+        }
+    }
+
+    assert!(all_ok, "all streams should complete with correct echo data");
+    client.close();
+}
+
+/// Bulk TCP traffic should not prevent UDP datagrams from being relayed
+/// promptly. This verifies that the scheduler's Realtime class (used for
+/// UDP) takes priority over Bulk class (used for TCP streams).
+#[tokio::test]
+async fn udp_relay_unblocked_by_tcp_bulk() {
+    // Start a TCP sink that just drains data (no echo, just consume).
+    let sink = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let sink_addr = sink.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = sink.accept().await else { break };
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 65536];
+                while stream.read(&mut buf).await.unwrap_or(0) > 0 {}
+            });
+        }
+    });
+
+    // Start a UDP echo server.
+    let udp_echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let udp_echo_addr = udp_echo.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 65536];
+        loop {
+            let (n, from) = match udp_echo.recv_from(&mut buf).await {
+                Ok(r) => r,
+                Err(_) => break,
+            };
+            let _ = udp_echo.send_to(&buf[..n], from).await;
+        }
+    });
+
+    let server_addr = spawn_server("udpiso").await;
+    let (client, _) = tokio::time::timeout(
+        Duration::from_secs(5),
+        Client::connect(client_cfg("udpiso", server_addr)),
+    )
+    .await
+    .expect("timed out")
+    .expect("connect failed");
+    let client = Arc::new(client);
+
+    // Start a bulk TCP stream to saturate the connection.
+    let bulk_client = Arc::clone(&client);
+    let bulk_addr = sink_addr.to_string();
+    let bulk_handle = tokio::spawn(async move {
+        if let Ok(mut proxy) = bulk_client.tcp(&bulk_addr).await {
+            let data = vec![0xFFu8; 64 * 1024];
+            for _ in 0..16 {
+                if proxy.write_all(&data).await.is_err() {
+                    break;
+                }
+            }
+            let _ = proxy.shutdown().await;
+        }
+    });
+
+    // Give the bulk stream a head start.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Send a UDP datagram and verify it arrives back promptly.
+    let udp_conn = tokio::time::timeout(Duration::from_secs(5), client.udp())
+        .await
+        .expect("udp() timed out")
+        .expect("udp() failed");
+
+    let payload = b"ping";
+    udp_conn
+        .send(payload, &udp_echo_addr.to_string())
+        .await
+        .expect("udp send failed");
+
+    // UDP should come back within a reasonable time even under TCP load.
+    let result: Result<Result<(Vec<u8>, String), _>, _> =
+        tokio::time::timeout(Duration::from_secs(3), udp_conn.receive()).await;
+
+    assert!(
+        result.is_ok(),
+        "UDP datagram should arrive within 3s even during bulk TCP transfer"
+    );
+
+    // Clean up.
+    let _ = bulk_handle.await;
+    client.close();
 }

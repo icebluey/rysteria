@@ -1,6 +1,9 @@
 pub mod errors;
 pub mod internal;
-
-// Phase 2+
+pub mod scheduler;
+pub mod connection_actor;
+pub mod flow_actor;
+pub mod tunnel_manager;
+pub mod hint_ipc;
 pub mod client;
 pub mod server;

@@ -14,7 +14,7 @@ path = "src/lib.rs"
 
 [dependencies]
 # Async runtime
-tokio = { version = "1.49", features = ["full"] }
+tokio = { version = "1.50", features = ["full"] }
 
 # QUIC + TLS
 quinn = { version = "0.11", default-features = false, features = ["rustls-aws-lc-rs", "runtime-tokio"] }
@@ -62,6 +62,7 @@ prost = { version = "0.14" }
 base64 = { version = "0.22" }
 once_cell = { version = "1" }
 libc = { version = "0.2" }
+socket2 = { version = "0.6", features = ["all"] }
 time = { version = "0.3", features = ["formatting"] }
 tun-rs = { version = "2", features = ["async"] }
 netstack-smoltcp = { version = "0.2" }
@@ -73,7 +74,7 @@ async-trait = { version = "0.1" }
 reqwest = { version = "0.13", default-features = true, features = ["json"] }
 hickory-resolver = { version = "0.25", default-features = false, features = ["tokio", "tls-aws-lc-rs", "https-aws-lc-rs", "webpki-roots"] }
 
-# HTTP/1.1 + HTTP/2 for masquerade TCP servers (Phase 5+)
+# HTTP/1.1 + HTTP/2 for masquerade TCP servers
 hyper = { version = "1", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = { version = "0.1" }

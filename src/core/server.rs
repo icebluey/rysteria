@@ -20,7 +20,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     task::{Context, Poll},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use bytes::Bytes;
@@ -38,7 +38,13 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+use std::sync::Mutex as StdMutex;
+
+use crate::core::connection_actor::{ConnControl, ConnectionActor};
+use crate::core::flow_actor;
 use crate::core::internal::congestion::switchable::{CongestionHandle, new_switchable_factory};
+use crate::core::internal::shard::{ConnId, ShardPool};
+use crate::core::scheduler::{FlowHints, FlowId, Scheduler, UdpSessionId};
 use crate::core::internal::frag::{Defragger, frag_udp_message, new_frag_packet_id};
 use crate::core::internal::pmtud::DISABLE_PATH_MTU_DISCOVERY;
 use crate::core::internal::protocol::{
@@ -153,6 +159,15 @@ pub struct ServerConfig {
     pub udp_idle_timeout: Duration,
     /// Optional Salamander obfuscation password.
     pub obfs_salamander_password: Option<String>,
+    /// Number of ShardPool shard threads.
+    ///
+    /// Each authenticated QUIC connection is pinned to a fixed OS thread via
+    /// `ShardPool`, eliminating cross-thread cache misses on hot-path connection
+    /// state (Pingora NoSteal pattern).
+    ///
+    /// Default: number of available CPUs (`std::thread::available_parallelism()`).
+    /// Set to 1 for single-threaded testing.
+    pub shard_threads: Option<usize>,
 }
 
 /// QUIC/H3 server for Hysteria protocol.
@@ -236,59 +251,151 @@ impl Server {
         })
     }
 
-    /// Accept connections forever, spawning a task for each.
+    /// Accept connections forever, pinning each to a ShardPool shard.
+    ///
+    /// Creates one `ShardPool` for the lifetime of the server (Pingora NoSteal
+    /// pattern). After TLS, each connection gets its own `ConnectionActor`
+    /// spawned on a fixed OS thread — all sends for that connection go through
+    /// the actor's `Scheduler` and never race across Tokio worker threads.
     pub async fn serve(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // One ShardPool per server lifetime. Connections are pinned via
+        // `conn_id % shard_count` — always deterministic, always the same thread.
+        let shard_count = self.config.shard_threads.unwrap_or_else(|| {
+            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
+        });
+        let shards = Arc::new(
+            ShardPool::new(shard_count)
+                .map_err(|e| format!("ShardPool creation failed: {e}"))?,
+        );
+        tracing::info!(shards = shard_count, "connection shard pool ready");
+
+        // graceful shutdown via Ctrl+C / SIGTERM.
+        // Stage 1: stop accept. Stage 2: drain (5s). Stage 3: force close.
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(async move {
+            // Wait for Ctrl+C (also catches SIGINT on Unix).
+            let _ = tokio::signal::ctrl_c().await;
+            tracing::info!("shutdown signal received — stopping accept loop");
+            let _ = shutdown_tx.send(true);
+        });
+
+        // Accept loop — Stage 1: stop when shutdown signal fires.
         loop {
-            let incoming = self.endpoint.accept().await.ok_or("endpoint closed")?;
-            let config = Arc::clone(&self.config);
-            let tls = Arc::clone(&self.tls);
-
-            tokio::spawn(async move {
-                let remote_addr = unmap_ipv4(incoming.remote_address());
-
-                // Create per-connection SwitchableFactory so each connection gets
-                // its own congestion handle.
-                let (factory, cc_handle) = new_switchable_factory();
-                let mut transport = if let Some(builder) = &config.transport_builder {
-                    builder()
-                } else {
-                    default_transport_config()
-                };
-                transport.congestion_controller_factory(Arc::new(factory));
-
-                // Build per-connection QUIC ServerConfig (reuses pre-built TLS).
-                let quic_crypto =
-                    match quinn_proto::crypto::rustls::QuicServerConfig::try_from(Arc::clone(&tls))
-                    {
-                        Ok(c) => c,
-                        Err(err) => {
-                            tracing::warn!(addr = %remote_addr, error = %err, "QUIC server config error");
-                            return;
-                        }
-                    };
-                let mut per_conn_cfg = quinn::ServerConfig::with_crypto(
-                    Arc::new(quic_crypto) as Arc<dyn quinn_proto::crypto::ServerConfig>
-                );
-                per_conn_cfg.transport_config(Arc::new(transport));
-
-                let connecting = match incoming.accept_with(Arc::new(per_conn_cfg)) {
-                    Ok(c) => c,
-                    Err(err) => {
-                        tracing::warn!(addr = %remote_addr, error = %err, "QUIC connection rejected");
-                        return;
-                    }
-                };
-
-                match connecting.await {
-                    Ok(conn) => {
-                        let _ = handle_connection(conn, config, cc_handle).await;
-                    }
-                    Err(err) => {
-                        tracing::warn!(addr = %remote_addr, error = %err, "TLS error");
+            tokio::select! {
+                // Shutdown takes priority: check it first to respond promptly.
+                biased;
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        break; // Stage 1 complete — stop accepting new connections.
                     }
                 }
-            });
+                incoming_opt = self.endpoint.accept() => {
+                    let incoming = match incoming_opt {
+                        None => break, // endpoint closed externally
+                        Some(i) => i,
+                    };
+                    let config = Arc::clone(&self.config);
+                    let tls = Arc::clone(&self.tls);
+                    let shards = Arc::clone(&shards);
+                    // Clone shutdown_rx so each connection task can detect Stage 2.
+                    let conn_shutdown_rx = shutdown_rx.clone();
+
+                    tokio::spawn(async move {
+                        let remote_addr = unmap_ipv4(incoming.remote_address());
+
+                        // Per-connection SwitchableFactory: each connection gets its own
+                        // congestion handle so Brutal and BBR are isolated.
+                        let (factory, cc_handle) = new_switchable_factory();
+                        let mut transport = if let Some(builder) = &config.transport_builder {
+                            builder()
+                        } else {
+                            default_transport_config()
+                        };
+                        transport.congestion_controller_factory(Arc::new(factory));
+
+                        // Build per-connection QUIC ServerConfig (reuses pre-built TLS).
+                        let quic_crypto = match quinn_proto::crypto::rustls::QuicServerConfig::try_from(Arc::clone(&tls)) {
+                            Ok(c) => c,
+                            Err(err) => {
+                                tracing::warn!(addr = %remote_addr, error = %err, "QUIC server config error");
+                                return;
+                            }
+                        };
+                        let mut per_conn_cfg = quinn::ServerConfig::with_crypto(
+                            Arc::new(quic_crypto) as Arc<dyn quinn_proto::crypto::ServerConfig>,
+                        );
+                        per_conn_cfg.transport_config(Arc::new(transport));
+
+                        let connecting = match incoming.accept_with(Arc::new(per_conn_cfg)) {
+                            Ok(c) => c,
+                            Err(err) => {
+                                tracing::warn!(addr = %remote_addr, error = %err, "QUIC connection rejected");
+                                return;
+                            }
+                        };
+
+                        match connecting.await {
+                            Ok(conn) => {
+                                // Assign a stable ConnId and build the send-path actor.
+                                let actor_conn_id = ConnId(rand::random::<u64>());
+                                let effective_bps = cc_handle.effective_bps_arc();
+
+                                // Shared scheduler: ConnectionActor owns the Scheduler;
+                                // TcpFlowActors borrow the Arc to call try_issue_permit.
+                                let scheduler = Arc::new(StdMutex::new(Scheduler::new(
+                                    Arc::clone(&effective_bps),
+                                )));
+
+                                // Control channel: TcpFlowActors → ConnectionActor.
+                                let (ctrl_tx, ctrl_rx) = mpsc::channel::<ConnControl>(4096);
+
+                                let actor = ConnectionActor::new(
+                                    conn.clone(),
+                                    Arc::clone(&scheduler),
+                                    ctrl_rx,
+                                );
+
+                                // Spawn ConnectionActor on the shard that owns this ConnId.
+                                // It never migrates — no cross-thread cache misses.
+                                shards.pin(actor_conn_id).spawn(async move {
+                                    actor.run().await;
+                                });
+
+                                let _ = handle_connection(
+                                    conn,
+                                    config,
+                                    cc_handle,
+                                    actor_conn_id,
+                                    ctrl_tx,
+                                    scheduler,
+                                    conn_shutdown_rx,
+                                )
+                                .await;
+                            }
+                            Err(err) => {
+                                tracing::warn!(addr = %remote_addr, error = %err, "TLS error");
+                            }
+                        }
+                    });
+                }
+            }
         }
+
+        // Stage 2: drain — wait for in-flight connections to close (up to 5 s).
+        // wait_idle() returns as soon as all QUIC connections have closed.
+        // Timeout ensures we don't block forever if a connection is stuck.
+        tracing::info!("graceful shutdown: draining in-flight connections (up to 5s)");
+        let _ = tokio::time::timeout(
+            Duration::from_secs(5),
+            self.endpoint.wait_idle(),
+        )
+        .await;
+
+        // Stage 3: force close — send NO_ERROR to all remaining QUIC connections.
+        self.endpoint.close(quinn::VarInt::from_u32(H3_ERR_NO_ERROR), b"shutdown");
+        tracing::info!("graceful shutdown complete");
+
+        Ok(())
     }
 
     /// Returns the local address this server is bound to.
@@ -305,10 +412,12 @@ impl Server {
 
 fn default_transport_config() -> quinn::TransportConfig {
     let mut t = quinn::TransportConfig::default();
-    // Enable datagrams for UDP relay (Phase 3)
+    // Enable datagrams for UDP relay
     t.initial_mtu(MAX_DATAGRAM_FRAME_SIZE as u16);
-    t.datagram_receive_buffer_size(Some(MAX_DATAGRAM_FRAME_SIZE as usize));
-    t.datagram_send_buffer_size(MAX_DATAGRAM_FRAME_SIZE as usize);
+    // Datagram buffer sizes: use Quinn defaults (~1.2 MiB receive, 1 MiB send).
+    // Previous code incorrectly set these to MAX_DATAGRAM_FRAME_SIZE (1200),
+    // confusing per-packet MTU with buffer capacity, which caused fragmented
+    // UDP messages to be silently dropped.
     if DISABLE_PATH_MTU_DISCOVERY {
         t.mtu_discovery_config(None);
     }
@@ -334,16 +443,26 @@ async fn handle_connection(
     quinn_conn: quinn::Connection,
     config: Arc<ServerConfig>,
     cc_handle: CongestionHandle,
+    actor_conn_id: ConnId,
+    ctrl_tx: mpsc::Sender<ConnControl>,
+    scheduler: Arc<StdMutex<Scheduler>>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let conn_id: u32 = rand::random();
     let auth_id = Arc::new(RwLock::new(None::<String>));
     let authenticated = Arc::new(AtomicBool::new(false));
     let auth_ready = Arc::new(Notify::new());
 
-    // Extract the effective-bps arc before cc_handle is consumed by the auth
-    // handler.  This arc is written by BrutalSender and read by the copy loop
-    // to enforce the application-level rate limit.
-    let effective_bps = cc_handle.effective_bps_arc();
+    // spawn a per-connection hint IPC listener.
+    // Browser extensions or media players send hints via a Unix socket at
+    // a well-known path derived from the connection ID. Hints are forwarded
+    // to the ConnectionActor via ctrl_tx → Scheduler::apply_hint().
+    let hint_cancel = CancellationToken::new();
+    crate::core::hint_ipc::spawn_hint_listener(actor_conn_id, ctrl_tx.clone(), hint_cancel.clone());
+
+    // effective_bps is written by BrutalSender; stored in the Scheduler
+    // for potential future rate-aware scheduling decisions.
+    let _effective_bps = cc_handle.effective_bps_arc();
 
     let (tcp_tx, mut tcp_rx) = mpsc::unbounded_channel::<RawTcpStream>();
     let hy_conn = HyServerConn::new(
@@ -360,14 +479,24 @@ async fn handle_connection(
         .await
         .map_err(|e| format!("h3 build error: {}", e))?;
 
-    // Spawn TCP proxy consumer task
+    // Clone scheduler params for the UDP path (H3 request handler) before
+    // the TCP consumer task moves the originals.
+    let ctrl_tx_udp = ctrl_tx.clone();
+    let scheduler_udp = Arc::clone(&scheduler);
+    let actor_conn_id_udp = actor_conn_id;
+
+    // Spawn TCP proxy consumer task.
+    // Each inbound TCP proxy stream gets a unique FlowId so the Scheduler
+    // can track per-flow credit and DRR fairness independently.
     {
         let config = Arc::clone(&config);
         let quinn_conn = quinn_conn.clone();
         let auth_id = Arc::clone(&auth_id);
         let authenticated = Arc::clone(&authenticated);
         let auth_ready = Arc::clone(&auth_ready);
-        let effective_bps = Arc::clone(&effective_bps);
+        // FlowId counter: monotonically increasing u64 per connection.
+        // Starts at 1 (0 is reserved).
+        let flow_id_counter = Arc::new(AtomicU64::new(1));
         tokio::spawn(async move {
             if !authenticated.load(Ordering::Acquire) {
                 tokio::select! {
@@ -382,10 +511,22 @@ async fn handle_connection(
                 let config = Arc::clone(&config);
                 let quinn_conn = quinn_conn.clone();
                 let auth_id = Arc::clone(&auth_id);
-                let effective_bps = Arc::clone(&effective_bps);
+                let ctrl_tx = ctrl_tx.clone();
+                let scheduler = Arc::clone(&scheduler);
+                let flow_id = FlowId(flow_id_counter.fetch_add(1, Ordering::Relaxed));
                 tokio::spawn(async move {
-                    handle_tcp_stream(raw, quinn_conn, config, auth_id, conn_id, effective_bps)
-                        .await;
+                    handle_tcp_stream(
+                        raw,
+                        quinn_conn,
+                        config,
+                        auth_id,
+                        conn_id,
+                        actor_conn_id,
+                        ctrl_tx,
+                        scheduler,
+                        flow_id,
+                    )
+                    .await;
                 });
             }
         });
@@ -398,36 +539,57 @@ async fn handle_connection(
     let cc_handle_opt = Arc::new(tokio::sync::Mutex::new(Some(cc_handle)));
     let udp_started = Arc::new(AtomicBool::new(false));
     loop {
-        match h3_conn.accept().await {
-            Ok(None) | Err(_) => break,
-            Ok(Some(resolver)) => {
-                let (req, stream) = match resolver.resolve_request().await {
-                    Ok(r) => r,
-                    Err(_) => break,
-                };
-                // Spawn per-request handler so the accept loop stays responsive.
-                // Go: `go handleRequest(...)` per prompt §8.1.
-                let quinn_conn2 = quinn_conn.clone();
-                let udp_started2 = Arc::clone(&udp_started);
-                let config2 = Arc::clone(&config);
-                let auth_id2 = Arc::clone(&auth_id);
-                let cc_handle2 = Arc::clone(&cc_handle_opt);
-                let authenticated2 = Arc::clone(&authenticated);
-                let auth_ready2 = Arc::clone(&auth_ready);
-                tokio::spawn(async move {
-                    handle_h3_request(
-                        req,
-                        stream,
-                        quinn_conn2,
-                        config2,
-                        cc_handle2,
-                        udp_started2,
-                        auth_id2,
-                        authenticated2,
-                        auth_ready2,
-                    )
-                    .await;
-                });
+        tokio::select! {
+            // when the server signals graceful shutdown, stop accepting
+            // new H3 requests and tell ConnectionActor to drain existing items.
+            biased;
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    // Send GracefulDrain: ConnectionActor will stop accepting new
+                    // streams and exit once the scheduler is empty.
+                    let _ = ctrl_tx_udp.send(ConnControl::GracefulDrain).await;
+                    break;
+                }
+            }
+            accept_result = h3_conn.accept() => {
+                match accept_result {
+                    Ok(None) | Err(_) => break,
+                    Ok(Some(resolver)) => {
+                        let (req, stream) = match resolver.resolve_request().await {
+                            Ok(r) => r,
+                            Err(_) => break,
+                        };
+                        // Spawn per-request handler so the accept loop stays responsive.
+                        // Go: `go handleRequest(...)` per prompt §8.1.
+                        let quinn_conn2 = quinn_conn.clone();
+                        let udp_started2 = Arc::clone(&udp_started);
+                        let config2 = Arc::clone(&config);
+                        let auth_id2 = Arc::clone(&auth_id);
+                        let cc_handle2 = Arc::clone(&cc_handle_opt);
+                        let authenticated2 = Arc::clone(&authenticated);
+                        let auth_ready2 = Arc::clone(&auth_ready);
+                        let ctrl_tx3 = ctrl_tx_udp.clone();
+                        let scheduler3 = Arc::clone(&scheduler_udp);
+                        let conn_id3 = actor_conn_id_udp;
+                        tokio::spawn(async move {
+                            handle_h3_request(
+                                req,
+                                stream,
+                                quinn_conn2,
+                                config2,
+                                cc_handle2,
+                                udp_started2,
+                                auth_id2,
+                                authenticated2,
+                                auth_ready2,
+                                ctrl_tx3,
+                                scheduler3,
+                                conn_id3,
+                            )
+                            .await;
+                        });
+                    }
+                }
             }
         }
     }
@@ -441,6 +603,11 @@ async fn handle_connection(
         }
     }
 
+    // Cancel the hint IPC listener for this connection.
+    hint_cancel.cancel();
+
+    // Signal ConnectionActor to shut down cleanly before closing the QUIC connection.
+    let _ = ctrl_tx_udp.send(ConnControl::Shutdown).await;
     let _ = quinn_conn.close(quinn::VarInt::from_u32(H3_ERR_NO_ERROR), b"");
     Ok(())
 }
@@ -455,6 +622,9 @@ async fn handle_h3_request<S>(
     auth_id: Arc<RwLock<Option<String>>>,
     authenticated: Arc<AtomicBool>,
     auth_ready: Arc<Notify>,
+    ctrl_tx: mpsc::Sender<ConnControl>,
+    scheduler: Arc<StdMutex<Scheduler>>,
+    actor_conn_id: ConnId,
 ) where
     S: QuicSendStream<Bytes>,
 {
@@ -546,7 +716,7 @@ async fn handle_h3_request<S>(
         }
     }
 
-    // Phase 3: spawn UDP session manager (once per connection).
+    // spawn UDP session manager (once per connection).
     if first_auth && !config.disable_udp && !udp_started.swap(true, Ordering::SeqCst) {
         let mgr = Arc::new(UdpSessionManager {
             sessions: Arc::new(RwLock::new(HashMap::new())),
@@ -555,6 +725,9 @@ async fn handle_h3_request<S>(
             } else {
                 config.udp_idle_timeout.as_secs().max(1)
             },
+            ctrl_tx: ctrl_tx.clone(),
+            scheduler: Arc::clone(&scheduler),
+            actor_conn_id,
         });
         let conn_clone = quinn_conn.clone();
         let traffic_logger = config.traffic_logger.clone();
@@ -688,12 +861,6 @@ impl Drop for StreamTraceGuard {
     }
 }
 
-fn is_disconnect_error(err: &io::Error) -> bool {
-    err.get_ref()
-        .and_then(|inner| inner.downcast_ref::<DisconnectError>())
-        .is_some_and(|marker| matches!(marker, DisconnectError::TrafficLimit))
-}
-
 #[derive(Debug)]
 enum DisconnectError {
     TrafficLimit,
@@ -722,7 +889,10 @@ async fn handle_tcp_stream(
     config: Arc<ServerConfig>,
     auth_id_ref: Arc<RwLock<Option<String>>>,
     conn_id: u32,
-    effective_bps: Arc<AtomicU64>,
+    actor_conn_id: ConnId,
+    ctrl_tx: mpsc::Sender<ConnControl>,
+    scheduler: Arc<StdMutex<Scheduler>>,
+    flow_id: FlowId,
 ) {
     let auth_id = match auth_id_ref.read().await.clone() {
         Some(v) => v,
@@ -826,9 +996,9 @@ async fn handle_tcp_stream(
             return;
         }
     };
-    let tcp_local = target_result.local_addr;
-    let tcp_peer = target_result.peer_addr;
-    let mut target = target_result.stream;
+    let _tcp_local = target_result.local_addr;
+    let _tcp_peer = target_result.peer_addr;
+    let target = target_result.stream;
 
     // Send success response
     if !hooked {
@@ -841,68 +1011,57 @@ async fn handle_tcp_stream(
 
     stream_stats.set_state(StreamState::Established);
 
+    // Split the QUIC stream into read/write halves.
+    // The write half goes directly to TcpFlowActor — no serialization through
+    // ConnectionActor. Each flow owns its QUIC stream writer independently.
+    let (quic_recv, send_writer) = stream.into_split();
+
+    // Split the outbound TCP connection into independent read/write halves.
+    let (target_r, mut target_w) = tokio::io::split(target);
+
+    // Write putback bytes (from request hook) to the outbound TCP socket
+    // before the download loop starts forwarding QUIC data.
     if !putback.is_empty() {
-        if target.write_all(&putback).await.is_ok() {
-            stream_stats
-                .tx
-                .fetch_add(putback.len() as u64, Ordering::Relaxed);
-            stream_stats.touch();
+        if target_w.write_all(&putback).await.is_err() {
+            let _ = ctrl_tx.send(ConnControl::FlowClosed(flow_id)).await;
+            if let Some(el) = &config.event_logger {
+                el.tcp_error(&remote, &auth_id, &req_addr, None);
+            }
+            return;
         }
+        stream_stats.tx.fetch_add(putback.len() as u64, Ordering::Relaxed);
+        stream_stats.touch();
     }
 
-    let copy_err = if let Some(logger) = config.traffic_logger.clone() {
-        let stats_a = Arc::clone(&stream_stats);
-        let logger_a = Arc::clone(&logger);
-        let id_a = auth_id.clone();
-        let stats_b = Arc::clone(&stream_stats);
-        let logger_b = Arc::clone(&logger);
-        let id_b = auth_id.clone();
-        copy_two_way_ex(
-            stream,
-            target,
-            effective_bps,
-            move |n| {
-                stats_a.touch();
-                stats_a.rx.fetch_add(n, Ordering::Relaxed);
-                logger_a.log_traffic(&id_a, 0, n)
-            },
-            move |n| {
-                stats_b.touch();
-                stats_b.tx.fetch_add(n, Ordering::Relaxed);
-                logger_b.log_traffic(&id_b, n, 0)
-            },
-        )
-        .await
-        .err()
-    } else {
-        copy_two_way(stream, target, effective_bps).await.err()
-    };
+    // Extract destination port for HeuristicClassifier (port-based hints).
+    // Format: "host:port" or "[ipv6]:port".
+    let dest_port = req_addr
+        .rsplit_once(':')
+        .and_then(|(_, port)| port.parse::<u16>().ok());
 
-    // Annotate copy errors with the outbound TCP socket addresses.
-    // Preserves disconnect-marker errors unchanged so is_disconnect_error still works.
-    let copy_err = copy_err.map(|e| {
-        if is_disconnect_error(&e) {
-            return e;
-        }
-        match (tcp_local, tcp_peer) {
-            (Some(local), Some(peer)) => {
-                io::Error::new(e.kind(), format!("tcp {local}→{peer}: {e}"))
-            }
-            _ => e,
-        }
-    });
+    // Spawn upload (permit-before-read → direct QUIC write) and download (QUIC recv → TCP write).
+    let hints = FlowHints { class: crate::core::scheduler::FlowClass::Bulk, dest_port, is_datagram_ingress: false };
+    let (upload_handle, download_handle) = flow_actor::spawn_tcp_flow(
+        flow_id,
+        actor_conn_id,
+        hints,
+        target_r,
+        target_w,
+        quic_recv,
+        send_writer,
+        ctrl_tx.clone(),
+        scheduler,
+    );
+
+    // Wait for either direction to complete. When one side finishes (EOF or
+    // error), the other winds down naturally via QUIC stream / TCP close.
+    tokio::select! {
+        _ = upload_handle => {}
+        _ = download_handle => {}
+    }
 
     if let Some(el) = &config.event_logger {
-        match copy_err.as_ref() {
-            Some(err) => el.tcp_error(&remote, &auth_id, &req_addr, Some(err)),
-            None => el.tcp_error(&remote, &auth_id, &req_addr, None),
-        }
-    }
-
-    if let Some(err) = copy_err {
-        if is_disconnect_error(&err) {
-            let _ = quinn_conn.close(quinn::VarInt::from_u32(0x107), b"");
-        }
+        el.tcp_error(&remote, &auth_id, &req_addr, None);
     }
 }
 
@@ -1060,233 +1219,6 @@ impl QStream {
     }
 }
 
-/// Bidirectional copy between a QUIC stream pair and a TCP connection.
-///
-/// Launches two independent copy tasks (Go: two goroutines). When one
-/// direction finishes (EOF or error) the other is awaited to completion,
-/// preserving TCP half-close semantics: a FIN in one direction does not
-/// immediately kill the other direction (needed for HTTP/1.1 Connection:close).
-///
-/// Go equivalent: `copyTwoWay(serverRw, remoteRw)` / `copy_buffer_log`.
-pub(crate) async fn copy_two_way(
-    stream: QStream,
-    remote: impl AsyncRead + AsyncWrite + Send + Unpin + 'static,
-    effective_bps: Arc<AtomicU64>,
-) -> std::io::Result<()> {
-    let (stream_r, stream_w) = stream.into_split();
-    let (remote_r, remote_w) = tokio::io::split(remote);
-
-    // Cancel token: when task a (QUIC→TCP) finishes it cancels this token so
-    // task b (TCP→QUIC) exits promptly instead of blocking on remote_r.read()
-    // while the upstream holds the TCP connection open (HTTP keep-alive).
-    // biased select! inside copy_tcp_to_quic drains any in-flight response bytes
-    // before honouring the cancel, so no data is truncated.
-    let cancel = CancellationToken::new();
-    let cancel_b = cancel.clone();
-
-    // QUIC recv -> TCP send.
-    let a = tokio::spawn(async move {
-        let mut stream_r = stream_r;
-        let mut remote_w = remote_w;
-        let result = tokio::io::copy(&mut stream_r, &mut remote_w).await.map(|_| ());
-        let _ = remote_w.shutdown().await;
-        cancel.cancel(); // signal task b to stop waiting for TCP data
-        result.map_err(|e| io::Error::new(e.kind(), format!("quic→tcp: {e}")))
-    });
-    // TCP recv -> QUIC send (application-level rate-limited).
-    let b = tokio::spawn(async move {
-        let result = copy_tcp_to_quic(remote_r, stream_w, effective_bps, |_| true, cancel_b).await;
-        result.map_err(|e| io::Error::new(e.kind(), format!("tcp→quic: {e}")))
-    });
-
-    // When one direction finishes first, drop the other JoinHandle (does NOT
-    // abort the task).  For task a finishing first: cancel has already been
-    // sent, so task b exits after draining buffered data and calls
-    // stream_w.shutdown() — no QUIC RESET_STREAM, no truncation.
-    // For task b finishing first: task a exits via QUIC close propagation.
-    tokio::select! {
-        r = a => r.map_err(join_err_to_io)?,
-        r = b => r.map_err(join_err_to_io)?,
-    }
-}
-
-#[inline]
-fn join_err_to_io(err: tokio::task::JoinError) -> std::io::Error {
-    std::io::Error::new(
-        std::io::ErrorKind::Other,
-        format!("copy task join error: {err}"),
-    )
-}
-
-/// Copy loop with traffic callback.
-///
-/// Go equivalent: `copyBufferLog` (core/server/copy.go).
-/// Buffer size is fixed at 32 KiB to match Go exactly.
-#[allow(dead_code)]
-pub(crate) async fn copy_buffer_log<R, W, F>(
-    mut src: R,
-    mut dst: W,
-    mut log: F,
-) -> std::io::Result<()>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-    F: FnMut(u64) -> bool,
-{
-    let mut buf = vec![0u8; 32 * 1024];
-    loop {
-        let n = src.read(&mut buf).await?;
-        if n == 0 {
-            dst.shutdown().await?;
-            return Ok(());
-        }
-        if !log(n as u64) {
-            return Err(traffic_limit_disconnect());
-        }
-        dst.write_all(&buf[..n]).await?;
-    }
-}
-
-/// Token-bucket rate-limited copy from TCP source to QUIC stream.
-///
-/// Reads `effective_bps` on every iteration (written by `BrutalSender::update_ack_rate`).
-/// When the value is 0 (BBR phase or Brutal not yet active) no throttling is applied.
-///
-/// The `log` callback is invoked with the byte count after every successful read.
-/// Returning `false` signals a traffic-limit disconnect (matches `copy_buffer_log`).
-///
-/// `cancel` is checked before every read.  The select is **biased toward data**:
-/// as long as the source has bytes ready, they are drained before the cancel is
-/// honoured.  This prevents truncated responses when the peer keeps the TCP
-/// connection alive after the last response byte (HTTP keep-alive).
-async fn copy_tcp_to_quic<R, W, F>(
-    mut src: R,
-    mut dst: W,
-    effective_bps: Arc<AtomicU64>,
-    mut log: F,
-    cancel: CancellationToken,
-) -> io::Result<()>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-    F: FnMut(u64) -> bool,
-{
-    // 32 KiB matches Go's copyBufferLog buffer size.
-    const BUF_SIZE: usize = 32 * 1024;
-    // Max burst window: 4 ms, matching Go BrutalSender's approach.
-    const BURST_NANOS: u64 = 4_000_000;
-
-    let mut buf = vec![0u8; BUF_SIZE];
-    // Token debt (negative means we owe sleep time).
-    let mut tokens: i64 = 0;
-    let mut last_refill = Instant::now();
-
-    loop {
-        // Biased: data is preferred over the cancel signal so that in-flight
-        // response bytes are never discarded.  Only when src.read() would block
-        // (no data available) does the cancel arm fire.
-        let n = tokio::select! {
-            biased;
-            r = src.read(&mut buf) => r?,
-            _ = cancel.cancelled() => {
-                dst.shutdown().await?;
-                return Ok(());
-            }
-        };
-        if n == 0 {
-            dst.shutdown().await?;
-            return Ok(());
-        }
-
-        if !log(n as u64) {
-            return Err(traffic_limit_disconnect());
-        }
-
-        let rate = effective_bps.load(Ordering::Relaxed);
-        if rate > 0 {
-            let now = Instant::now();
-            let elapsed_nanos = now.duration_since(last_refill).as_nanos();
-            last_refill = now;
-
-            // Refill tokens proportional to elapsed time.
-            let new_tokens = (rate as u128 * elapsed_nanos / 1_000_000_000) as i64;
-            let max_burst = (rate as u128 * BURST_NANOS as u128 / 1_000_000_000) as i64;
-            tokens = (tokens + new_tokens).min(max_burst);
-
-            // Consume tokens for this chunk.
-            tokens -= n as i64;
-
-            // If in debt, sleep until the deficit is repaid.
-            // Do NOT reset tokens or last_refill after the sleep: the next
-            // iteration's elapsed computation will naturally credit the time
-            // spent sleeping (including any over-sleep from timer granularity),
-            // keeping the long-term average rate at bps/ack_rate.
-            if tokens < 0 {
-                let sleep_nanos =
-                    ((-tokens) as u128 * 1_000_000_000 / rate as u128) as u64;
-                tokio::time::sleep(Duration::from_nanos(sleep_nanos)).await;
-            }
-        }
-
-        dst.write_all(&buf[..n]).await?;
-    }
-}
-
-/// Two-way copy variant that reports per-direction byte counters through callbacks.
-///
-/// This mirrors Go `copyTwoWayEx` behavior and is used by upper layers that need
-/// traffic accounting. Same abort semantics as `copy_two_way`.
-#[allow(dead_code)]
-pub(crate) async fn copy_two_way_ex<F1, F2>(
-    stream: QStream,
-    remote: impl AsyncRead + AsyncWrite + Send + Unpin + 'static,
-    effective_bps: Arc<AtomicU64>,
-    log_rx: F1,
-    log_tx: F2,
-) -> std::io::Result<()>
-where
-    F1: FnMut(u64) -> bool + Send + 'static,
-    F2: FnMut(u64) -> bool + Send + 'static,
-{
-    let (stream_r, stream_w) = stream.into_split();
-    let (remote_r, remote_w) = tokio::io::split(remote);
-
-    let cancel = CancellationToken::new();
-    let cancel_a = cancel.clone();
-
-    // remote -> stream (RX direction: bytes received from remote, tcp→quic, rate-limited)
-    let a = tokio::spawn(async move {
-        let result = copy_tcp_to_quic(remote_r, stream_w, effective_bps, log_rx, cancel_a).await;
-        result.map_err(|e| {
-            if is_disconnect_error(&e) {
-                e
-            } else {
-                io::Error::new(e.kind(), format!("tcp→quic: {e}"))
-            }
-        })
-    });
-    // stream -> remote (TX direction: bytes sent to remote, quic→tcp)
-    let b = tokio::spawn(async move {
-        let mut stream_r = stream_r;
-        let mut remote_w = remote_w;
-        let result = copy_buffer_log(&mut stream_r, &mut remote_w, log_tx).await;
-        let _ = remote_w.shutdown().await;
-        cancel.cancel(); // signal task a to stop waiting for TCP data
-        result.map_err(|e| {
-            if is_disconnect_error(&e) {
-                e
-            } else {
-                io::Error::new(e.kind(), format!("quic→tcp: {e}"))
-            }
-        })
-    });
-
-    tokio::select! {
-        r = a => r.map_err(join_err_to_io)?,
-        r = b => r.map_err(join_err_to_io)?,
-    }
-}
-
 // ──────────────────────────────────────────────────────────────────────────────
 // UDP relay session manager (server-side)
 //
@@ -1354,6 +1286,12 @@ struct UdpSessionEntry {
     /// Called after the session closes; removes this entry from the sessions map.
     /// Go: `ExitFunc func(err error)`.
     exit_func: UdpExitFunc,
+    /// Channel to ConnectionActor for submitting UDP datagrams through Scheduler.
+    ctrl_tx: mpsc::Sender<ConnControl>,
+    /// Shared Scheduler for Realtime permit acquisition.
+    sched: Arc<StdMutex<Scheduler>>,
+    /// Connection identifier for permit requests.
+    actor_conn_id: ConnId,
 }
 
 /// Server-side UDP session manager.
@@ -1367,6 +1305,12 @@ struct UdpSessionManager {
     sessions: Arc<RwLock<HashMap<u32, Arc<UdpSessionEntry>>>>,
     /// Close idle sessions after this many seconds of inactivity.
     idle_timeout_secs: u64,
+    /// Channel to ConnectionActor for submitting UDP datagrams through Scheduler.
+    ctrl_tx: mpsc::Sender<ConnControl>,
+    /// Shared Scheduler for Realtime permit acquisition.
+    scheduler: Arc<StdMutex<Scheduler>>,
+    /// Connection identifier for permit requests.
+    actor_conn_id: ConnId,
 }
 
 // ── UdpSessionEntry methods ──────────────────────────────────────────────────
@@ -1466,13 +1410,17 @@ async fn entry_feed(
                         *entry.override_addr.lock().await = Some(actual_addr.clone());
                         *entry.original_addr.lock().await = Some(addr.clone());
                     }
-                    // Spawn per-session receive loop
+                    // Spawn per-session receive loop (sends through Scheduler
+                    // with Realtime priority via ConnectionActor).
                     let recv_handle = tokio::spawn(session_receive_loop(
                         Arc::clone(&entry),
                         Arc::clone(&socket),
                         conn.clone(),
                         auth_id.to_string(),
                         traffic_logger.clone(),
+                        entry.ctrl_tx.clone(),
+                        Arc::clone(&entry.sched),
+                        entry.actor_conn_id,
                     ));
                     *guard = EntryConnState::Connected {
                         socket: Arc::clone(&socket),
@@ -1592,8 +1540,8 @@ async fn idle_cleanup_loop(mgr: Arc<UdpSessionManager>, cancel: CancellationToke
 /// Scan the sessions map and close sessions that have been idle too long.
 ///
 /// Two-phase lock pattern to avoid deadlock:
-///   Phase 1 (RLock): collect expired entries.
-///   Phase 2: call `close_with_err` on each (which internally write-locks sessions).
+///   (RLock): collect expired entries.
+///   call `close_with_err` on each (which internally write-locks sessions).
 ///
 /// Go: `func (m *udpSessionManager) cleanup(idleOnly bool)` with `idleOnly=true`.
 async fn cleanup_idle_sessions(mgr: &UdpSessionManager) {
@@ -1715,6 +1663,9 @@ async fn mgr_feed(
         closed: AtomicBool::new(false),
         dial_func,
         exit_func,
+        ctrl_tx: mgr.ctrl_tx.clone(),
+        sched: Arc::clone(&mgr.scheduler),
+        actor_conn_id: mgr.actor_conn_id,
     });
 
     {
@@ -1727,10 +1678,16 @@ async fn mgr_feed(
 
 // ── Per-session upstream receive loop ────────────────────────────────────────
 
-/// Reads UDP packets from the upstream socket and sends them to the client as
-/// QUIC datagrams.
+/// Reads UDP packets from the upstream socket and sends them to the client
+/// through the ConnectionActor's Scheduler with Realtime priority.
 ///
-/// Exits when either the socket returns an error or `send_message_auto_frag` fails.
+/// Instead of sending QUIC datagrams directly, each packet is:
+///   1. Encoded as UdpMessage and fragmented if needed.
+///   2. Gated by a Realtime permit from the Scheduler's PermitBank.
+///   3. Submitted to ConnectionActor via ConnControl::UdpDatagram.
+///
+/// This ensures UDP traffic gets strict priority over TCP bulk in the Scheduler
+/// (Realtime > Bulk), preventing bulk downloads from starving real-time UDP.
 ///
 /// Go: `func (e *udpSessionEntry) receiveLoop()`.
 async fn session_receive_loop(
@@ -1739,8 +1696,13 @@ async fn session_receive_loop(
     conn: quinn::Connection,
     auth_id: String,
     traffic_logger: Option<Arc<dyn TrafficLogger>>,
+    ctrl_tx: mpsc::Sender<ConnControl>,
+    scheduler: Arc<StdMutex<Scheduler>>,
+    actor_conn_id: ConnId,
 ) {
-    let mut udp_buf = vec![0u8; MAX_UDP_SIZE]; // Go: make([]byte, protocol.MaxUDPSize)
+    let mut udp_buf = vec![0u8; MAX_UDP_SIZE];
+    let session_id = UdpSessionId(entry.id);
+    let hints = FlowHints::realtime();
 
     loop {
         let (n, r_addr) = match socket.recv_from(&mut udp_buf).await {
@@ -1755,7 +1717,6 @@ async fn session_receive_loop(
         entry.last.update();
 
         // Use original address in reverse direction if override was applied
-        // Go: `if e.OriginalAddr != "" { rAddr = e.OriginalAddr }`
         let addr = {
             let oa = entry.original_addr.lock().await;
             oa.clone().unwrap_or(r_addr)
@@ -1778,47 +1739,52 @@ async fn session_receive_loop(
             }
         }
 
-        if let Err(_) = send_message_auto_frag(&conn, &msg).await {
-            entry
-                .close_with_err(Some(io::Error::other("udp datagram send error")))
-                .await;
-            return;
+        // Encode UdpMessage and fragment if needed, then send through Scheduler.
+        let max_size = conn.max_datagram_size().unwrap_or(MAX_DATAGRAM_FRAME_SIZE as usize);
+        let full_bytes = msg.to_bytes();
+        let datagrams: Vec<Bytes> = if full_bytes.len() <= max_size {
+            vec![Bytes::from(full_bytes)]
+        } else {
+            let mut msg = msg;
+            msg.pkt_id = new_frag_packet_id();
+            frag_udp_message(&msg, max_size)
+                .into_iter()
+                .map(|f| Bytes::from(f.to_bytes()))
+                .collect()
+        };
+
+        for datagram in datagrams {
+            // Acquire Realtime permit (short sleep retry, same pattern as TcpFlowActor).
+            let permit = loop {
+                let flow_id = FlowId(session_id.0 as u64);
+                let maybe = {
+                    let mut sched = scheduler.lock().unwrap();
+                    sched.try_issue_permit(actor_conn_id, Some(flow_id), &hints, datagram.len())
+                };
+                if let Some(p) = maybe {
+                    break p;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            };
+
+            if ctrl_tx
+                .send(ConnControl::UdpDatagram {
+                    payload: datagram,
+                    permit,
+                })
+                .await
+                .is_err()
+            {
+                entry
+                    .close_with_err(Some(io::Error::other("ConnectionActor closed")))
+                    .await;
+                return;
+            }
         }
     }
 }
 
 // ── Auto-fragmentation helper ─────────────────────────────────────────────────
-
-/// Try to send a UDP message as a single QUIC datagram.
-/// If the message is too large, fragment it and send the pieces.
-///
-/// Go: `func sendMessageAutoFrag(io udpIO, buf []byte, msg *UDPMessage) error`.
-async fn send_message_auto_frag(conn: &quinn::Connection, msg: &UdpMessage) -> std::io::Result<()> {
-    let bytes = bytes::Bytes::from(msg.to_bytes());
-    match conn.send_datagram_wait(bytes).await {
-        Ok(()) => Ok(()),
-        Err(quinn::SendDatagramError::TooLarge) => {
-            // Message too large — fragment and resend
-            let max_size = conn
-                .max_datagram_size()
-                .unwrap_or(MAX_DATAGRAM_FRAME_SIZE as usize);
-            // Go: `msg.PacketID = uint16(rand.Intn(0xFFFF)) + 1`
-            let mut msg = msg.clone();
-            msg.pkt_id = new_frag_packet_id();
-            let frags = frag_udp_message(&msg, max_size);
-            for frag in frags {
-                let bytes = bytes::Bytes::from(frag.to_bytes());
-                conn.send_datagram_wait(bytes)
-                    .await
-                    .map_err(|e| std::io::Error::other(format!("udp datagram send failed: {e}")))?;
-            }
-            Ok(())
-        }
-        Err(e) => Err(std::io::Error::other(format!(
-            "udp datagram send failed: {e}"
-        ))),
-    }
-}
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Protocol helpers — async stream reading
@@ -2379,8 +2345,7 @@ impl SendStreamWriter {
 
 #[cfg(test)]
 mod tests {
-    use super::{copy_buffer_log, server_target_bps};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
+    use super::server_target_bps;
 
     #[test]
     fn server_target_bps_matches_go_server_cap_logic() {
@@ -2390,23 +2355,5 @@ mod tests {
         assert_eq!(server_target_bps(2000, 1000, false), 1000);
         assert_eq!(server_target_bps(1000, 2000, false), 1000);
         assert_eq!(server_target_bps(1000, 2000, true), 0);
-    }
-
-    #[tokio::test]
-    async fn copy_buffer_log_disconnects_when_logger_rejects() {
-        let (mut tx, src) = duplex(64);
-        let (dst, mut rx) = duplex(64);
-
-        let worker = tokio::spawn(async move { copy_buffer_log(src, dst, |_n| false).await });
-
-        tx.write_all(b"abc").await.unwrap();
-        drop(tx);
-
-        let err = worker.await.unwrap().unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::ConnectionReset);
-
-        let mut buf = [0u8; 8];
-        let n = rx.read(&mut buf).await.unwrap();
-        assert_eq!(n, 0);
     }
 }

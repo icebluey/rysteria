@@ -7,7 +7,7 @@
 /// 2. Perform HTTP/3 auth (POST /auth to "hysteria/auth").
 /// 3. On success (status 233), the raw `quinn::Connection` is used for
 ///    TCP proxy streams (frame type 0x401 + address) and UDP relay via
-///    QUIC datagrams (Phase 3).
+///    QUIC datagrams.
 use std::{
     collections::HashMap,
     error::Error,
@@ -29,6 +29,7 @@ use crate::core::errors::ClosedError;
 use crate::core::internal::congestion::switchable::new_switchable_factory;
 use crate::core::internal::frag::{Defragger, frag_udp_message, new_frag_packet_id};
 use crate::core::internal::pmtud::DISABLE_PATH_MTU_DISCOVERY;
+use crate::core::tunnel_manager::TunnelManager;
 use crate::core::internal::protocol::{
     DEFAULT_CONN_RECEIVE_WINDOW, DEFAULT_STREAM_RECEIVE_WINDOW, HEADER_AUTH, HEADER_CC_RX,
     HEADER_PADDING, HEADER_UDP_ENABLED, MAX_DATAGRAM_FRAME_SIZE, MAX_MESSAGE_LENGTH,
@@ -86,6 +87,22 @@ pub struct ClientConfig {
     /// Fast open mode: return from `tcp()` after request write, and defer
     /// server response parsing to the first read.
     pub fast_open: bool,
+    /// Enable persistent tunnel via TunnelManager. Default: true.
+    ///
+    /// When enabled, a single QUIC connection is kept warm and reused
+    /// for all TCP proxy and UDP relay requests, eliminating per-request
+    /// QUIC handshake overhead.
+    pub persistent_tunnel: bool,
+    /// Tunnel keepalive interval in seconds. Default: 25.
+    ///
+    /// The keepalive fires more frequently than the server's 30-second
+    /// idle timeout so the tunnel is never reaped while the client is active.
+    pub tunnel_keepalive_secs: u64,
+    /// Connection send budget for PermitBank (bytes). Default: 32 MiB.
+    ///
+    /// Controls how much data can be buffered in the send pipeline before
+    /// backpressure kicks in. Larger values trade memory for throughput.
+    pub conn_send_budget: Option<usize>,
 }
 
 /// Client UDP packet transport mode.
@@ -318,7 +335,7 @@ impl Client {
             let _ = keep_rx.await;
         });
 
-        // Phase 3: create client-side UDP session manager only when UDP is enabled.
+        // create client-side UDP session manager only when UDP is enabled.
         // Go: this is conditional on auth response.
         let udp_mgr = if udp_enabled {
             Some(ClientUdpSessionManager::new(conn.clone()))
@@ -525,8 +542,14 @@ where
 /// Reconnectable client wrapper.
 ///
 /// Go equivalent: `reconnectableClientImpl` in `core/client/reconnect.go`.
+///
+/// When `persistent_tunnel` is enabled in ClientConfig, delegates to
+/// `TunnelManager` for connection lifecycle (keepalive, proactive reconnect).
+/// Otherwise, uses the original lazy-reconnect-on-ClosedError behavior.
 pub struct ReconnectableClient {
     inner: AsyncMutex<ReconnectableInner>,
+    /// When persistent_tunnel is enabled, TunnelManager owns the connection.
+    tunnel_mgr: Option<Arc<TunnelManager>>,
 }
 
 struct ReconnectableInner {
@@ -541,6 +564,9 @@ impl ReconnectableClient {
     /// Create a reconnectable wrapper.
     ///
     /// If `lazy` is false, the first connection is established immediately.
+    /// If the first call to `config_func` produces a config with
+    /// `persistent_tunnel == true`, a TunnelManager is created and its
+    /// keepalive loop is spawned in the background.
     pub async fn new<F, C>(
         config_func: F,
         connected_func: Option<C>,
@@ -550,21 +576,85 @@ impl ReconnectableClient {
         F: Fn() -> Result<ClientConfig, BoxError> + Send + Sync + 'static,
         C: Fn(Arc<Client>, &HandshakeInfo, u32) + Send + Sync + 'static,
     {
-        let mut inner = ReconnectableInner {
-            config_func: Arc::new(config_func),
-            connected_func: connected_func.map(|f| {
+        let config_func: Arc<dyn Fn() -> Result<ClientConfig, BoxError> + Send + Sync> =
+            Arc::new(config_func);
+        let connected_func: Option<Arc<dyn Fn(Arc<Client>, &HandshakeInfo, u32) + Send + Sync>> =
+            connected_func.map(|f| {
                 Arc::new(f) as Arc<dyn Fn(Arc<Client>, &HandshakeInfo, u32) + Send + Sync>
-            }),
-            client: None,
-            count: 0,
-            closed: false,
-        };
-        if !lazy {
-            inner.reconnect().await?;
+            });
+
+        // Probe config to check persistent_tunnel setting.
+        let probe_config = (config_func)()?;
+        let persistent = probe_config.persistent_tunnel;
+        let keepalive_secs = probe_config.tunnel_keepalive_secs;
+
+        if persistent {
+            // Build a ConnectFactory from config_func + connected_func.
+            let cf = Arc::clone(&config_func);
+            let cb = connected_func.clone();
+            let count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+            let factory: crate::core::tunnel_manager::ConnectFactory = Arc::new(move || {
+                let cf = Arc::clone(&cf);
+                let cb = cb.clone();
+                let count = Arc::clone(&count);
+                Box::pin(async move {
+                    let config = cf()?;
+                    let (client, info) = Client::connect(config).await?;
+                    let n = count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    // Call connected_func if set. We create a temporary Arc for the
+                    // callback (it expects Arc<Client>), but since we just created it
+                    // and the callback is synchronous, try_unwrap always succeeds.
+                    if let Some(cb) = &cb {
+                        let arc = Arc::new(client);
+                        cb(Arc::clone(&arc), &info, n);
+                        let client = Arc::try_unwrap(arc)
+                            .unwrap_or_else(|_| panic!("connected_func must not retain Arc<Client>"));
+                        return Ok((client, info));
+                    }
+                    Ok((client, info))
+                })
+            });
+
+            let interval = Duration::from_secs(keepalive_secs);
+            let mgr = Arc::new(TunnelManager::new(interval, factory));
+
+            // Spawn background keepalive loop.
+            tokio::spawn(Arc::clone(&mgr).keepalive_loop());
+
+            // If not lazy, establish the first connection now.
+            if !lazy {
+                mgr.get_or_connect().await?;
+            }
+
+            let inner = ReconnectableInner {
+                config_func,
+                connected_func,
+                client: None,
+                count: 0,
+                closed: false,
+            };
+
+            Ok(Self {
+                inner: AsyncMutex::new(inner),
+                tunnel_mgr: Some(mgr),
+            })
+        } else {
+            // Original lazy-reconnect behavior.
+            let mut inner = ReconnectableInner {
+                config_func,
+                connected_func,
+                client: None,
+                count: 0,
+                closed: false,
+            };
+            if !lazy {
+                inner.reconnect().await?;
+            }
+            Ok(Self {
+                inner: AsyncMutex::new(inner),
+                tunnel_mgr: None,
+            })
         }
-        Ok(Self {
-            inner: AsyncMutex::new(inner),
-        })
     }
 
     async fn client_do<R, F, Fut>(&self, f: F) -> Result<R, BoxError>
@@ -572,35 +662,56 @@ impl ReconnectableClient {
         F: FnOnce(Arc<Client>) -> Fut,
         Fut: Future<Output = Result<R, BoxError>>,
     {
-        let client = {
-            let mut inner = self.inner.lock().await;
-            if inner.closed {
-                return Err(Box::new(ClosedError));
+        // Tunnel-managed path: get client from TunnelManager.
+        if let Some(mgr) = &self.tunnel_mgr {
+            {
+                let inner = self.inner.lock().await;
+                if inner.closed {
+                    return Err(Box::new(ClosedError));
+                }
             }
-            if inner.client.is_none() {
-                inner.reconnect().await?;
+            let handle = mgr.get_or_connect().await?;
+            let client = handle.client_arc();
+            match f(client).await {
+                Err(err) if err.downcast_ref::<ClosedError>().is_some() => {
+                    // Tunnel is dead, invalidate so next call reconnects.
+                    mgr.invalidate().await;
+                    Err(err)
+                }
+                other => other,
             }
-            inner
-                .client
-                .as_ref()
-                .cloned()
-                .ok_or_else(|| Box::new(ClosedError) as BoxError)?
-        };
-
-        let old_client = Arc::clone(&client);
-        match f(client).await {
-            Err(err) if err.downcast_ref::<ClosedError>().is_some() => {
+        } else {
+            // Original lazy-reconnect path.
+            let client = {
                 let mut inner = self.inner.lock().await;
-                if inner
+                if inner.closed {
+                    return Err(Box::new(ClosedError));
+                }
+                if inner.client.is_none() {
+                    inner.reconnect().await?;
+                }
+                inner
                     .client
                     .as_ref()
-                    .is_some_and(|current| Arc::ptr_eq(current, &old_client))
-                {
-                    inner.client = None;
+                    .cloned()
+                    .ok_or_else(|| Box::new(ClosedError) as BoxError)?
+            };
+
+            let old_client = Arc::clone(&client);
+            match f(client).await {
+                Err(err) if err.downcast_ref::<ClosedError>().is_some() => {
+                    let mut inner = self.inner.lock().await;
+                    if inner
+                        .client
+                        .as_ref()
+                        .is_some_and(|current| Arc::ptr_eq(current, &old_client))
+                    {
+                        inner.client = None;
+                    }
+                    Err(err)
                 }
-                Err(err)
+                other => other,
             }
-            other => other,
         }
     }
 
@@ -621,6 +732,9 @@ impl ReconnectableClient {
     pub async fn close(&self) -> Result<(), BoxError> {
         let mut inner = self.inner.lock().await;
         inner.closed = true;
+        if let Some(mgr) = &self.tunnel_mgr {
+            mgr.invalidate().await;
+        }
         if let Some(client) = inner.client.take() {
             client.close();
         }
@@ -1209,8 +1323,10 @@ async fn read_tcp_response_async(r: &mut (impl AsyncRead + Unpin)) -> std::io::R
 fn default_client_transport() -> quinn::TransportConfig {
     let mut t = quinn::TransportConfig::default();
     t.initial_mtu(MAX_DATAGRAM_FRAME_SIZE as u16);
-    t.datagram_receive_buffer_size(Some(MAX_DATAGRAM_FRAME_SIZE as usize));
-    t.datagram_send_buffer_size(MAX_DATAGRAM_FRAME_SIZE as usize);
+    // Datagram buffer sizes: use Quinn defaults (~1.2 MiB receive, 1 MiB send).
+    // Previous code incorrectly set these to MAX_DATAGRAM_FRAME_SIZE (1200),
+    // confusing per-packet MTU with buffer capacity, which caused fragmented
+    // UDP messages to be silently dropped.
     if DISABLE_PATH_MTU_DISCOVERY {
         t.mtu_discovery_config(None);
     }
