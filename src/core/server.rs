@@ -453,13 +453,6 @@ async fn handle_connection(
     let authenticated = Arc::new(AtomicBool::new(false));
     let auth_ready = Arc::new(Notify::new());
 
-    // spawn a per-connection hint IPC listener.
-    // Browser extensions or media players send hints via a Unix socket at
-    // a well-known path derived from the connection ID. Hints are forwarded
-    // to the ConnectionActor via ctrl_tx → Scheduler::apply_hint().
-    let hint_cancel = CancellationToken::new();
-    crate::core::hint_ipc::spawn_hint_listener(actor_conn_id, ctrl_tx.clone(), hint_cancel.clone());
-
     // effective_bps is written by BrutalSender; stored in the Scheduler
     // for potential future rate-aware scheduling decisions.
     let _effective_bps = cc_handle.effective_bps_arc();
@@ -602,9 +595,6 @@ async fn handle_connection(
             el.disconnect(&quinn_conn.remote_address(), &id, None);
         }
     }
-
-    // Cancel the hint IPC listener for this connection.
-    hint_cancel.cancel();
 
     // Signal ConnectionActor to shut down cleanly before closing the QUIC connection.
     let _ = ctrl_tx_udp.send(ConnControl::Shutdown).await;

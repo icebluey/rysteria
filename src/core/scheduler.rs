@@ -14,7 +14,6 @@
 ///   - PermitBank: three-level backpressure (connection -> class -> flow).
 ///   - FlowMeta: per-flow stats, reclassification, continuation credits.
 ///   - tick(): periodic maintenance (reclassify, credits, permit reclaim).
-///   - apply_hint(): client cooperation hints.
 ///
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -101,40 +100,6 @@ impl FlowHints {
     pub fn realtime() -> Self {
         Self { class: FlowClass::RealtimeDatagram, dest_port: None, is_datagram_ingress: true }
     }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// VisibilityHint
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Client cooperation hint — sent by browser extensions, media players, or
-/// other cooperating processes via the hint IPC socket.
-///
-/// Hints improve scheduling accuracy but the scheduler works correctly without
-/// them (every hint has a network-layer fallback). Applied via
-/// `Scheduler::apply_hint()`, delivered through `ConnControl::ApplyHint`.
-///
-/// ## Hint effects
-/// | Hint              | Effect                                                |
-/// |-------------------|-------------------------------------------------------|
-/// | FlowVisible       | Marks flow as visible in FlowMeta                     |
-/// | MediaPlaying      | continuation_credit floored at 4 for StreamingMedia   |
-/// | FlowHidden        | Clears visible flag; stale detection handles naturally |
-/// | MediaPaused       | Clears flag; credit decays via idle_rounds             |
-/// | GenerationObsolete| Reclaim 100% of budget for that generation             |
-#[derive(Debug, Clone)]
-pub enum VisibilityHint {
-    /// The flow's content is currently visible on screen.
-    FlowVisible { flow_id: FlowId, generation: u64 },
-    /// The flow's content is no longer visible.
-    FlowHidden { flow_id: FlowId },
-    /// The flow is an actively playing media stream.
-    MediaPlaying { flow_id: FlowId },
-    /// The flow's media playback is paused.
-    MediaPaused { flow_id: FlowId },
-    /// All flows from this generation are obsolete (e.g., page navigated away).
-    /// Triggers aggressive reclaim: 100% budget reclaim.
-    GenerationObsolete { generation: u64 },
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -249,13 +214,6 @@ pub struct FlowMeta {
     /// True if permits held by this flow can be partially reclaimed when idle.
     /// Datagram flows are not reclaimable.
     pub reclaimable: bool,
-
-    /// Generation tag set by the client hint source.
-    pub hinted_generation: Option<u64>,
-    /// True if the hint source says this flow's content is currently visible on screen.
-    pub hinted_visible: bool,
-    /// True if the hint source says this flow is actively playing media.
-    pub hinted_media_playing: bool,
 }
 
 impl FlowMeta {
@@ -267,9 +225,6 @@ impl FlowMeta {
             continuation_credit: 0,
             demotable: !is_datagram,
             reclaimable: !is_datagram,
-            hinted_generation: None,
-            hinted_visible: false,
-            hinted_media_playing: false,
         }
     }
 
@@ -359,11 +314,6 @@ fn update_continuation_credits(flow_meta: &mut HashMap<FlowId, FlowMeta>) {
         } else if meta.stats.idle_rounds > 0 {
             // Any idle round decays credit by 1.
             meta.continuation_credit = meta.continuation_credit.saturating_sub(1);
-        }
-
-        // MediaPlaying hint: floor credit at 4 for actively playing streams.
-        if meta.hinted_media_playing {
-            meta.continuation_credit = meta.continuation_credit.max(4);
         }
     }
 }
@@ -725,55 +675,6 @@ impl Scheduler {
         self.permits.transfer_flow_class(flow_id, old_class, new_class);
     }
 
-    /// Apply a client cooperation hint to the scheduler.
-    ///
-    /// Adjusts scheduling parameters for affected flows. Core scheduling works
-    /// correctly without hints — every hint has a network-layer fallback.
-    pub fn apply_hint(&mut self, hint: VisibilityHint) {
-        match hint {
-            VisibilityHint::FlowVisible { flow_id, generation } => {
-                if let Some(meta) = self.flow_meta.get_mut(&flow_id) {
-                    meta.hinted_visible = true;
-                    meta.hinted_generation = Some(generation);
-                }
-            }
-            VisibilityHint::FlowHidden { flow_id } => {
-                if let Some(meta) = self.flow_meta.get_mut(&flow_id) {
-                    meta.hinted_visible = false;
-                }
-            }
-            VisibilityHint::MediaPlaying { flow_id } => {
-                if let Some(meta) = self.flow_meta.get_mut(&flow_id) {
-                    meta.hinted_media_playing = true;
-                    meta.continuation_credit = meta.continuation_credit.max(4);
-                }
-            }
-            VisibilityHint::MediaPaused { flow_id } => {
-                if let Some(meta) = self.flow_meta.get_mut(&flow_id) {
-                    meta.hinted_media_playing = false;
-                }
-            }
-            VisibilityHint::GenerationObsolete { generation } => {
-                let obsolete: Vec<(FlowId, FlowClass)> = self
-                    .flow_meta
-                    .iter()
-                    .filter(|(_, m)| m.hinted_generation == Some(generation))
-                    .map(|(id, m)| (*id, m.class))
-                    .collect();
-                for (flow_id, class) in obsolete {
-                    let budget = self.permits.flow_budget_available(flow_id);
-                    if budget > 0 {
-                        self.permits.reclaim_from_flow(flow_id, class, budget);
-                    }
-                    if let Some(meta) = self.flow_meta.get_mut(&flow_id) {
-                        meta.hinted_visible = false;
-                        meta.hinted_generation = None;
-                    }
-                }
-            }
-        }
-    }
-
     // ─────────────────────────────────────────────────────────────────────────
     // Test helpers (not compiled into production builds)
     // ─────────────────────────────────────────────────────────────────────────
@@ -901,9 +802,6 @@ mod tests {
             continuation_credit: 0,
             demotable: true,
             reclaimable: true,
-            hinted_generation: None,
-            hinted_visible: false,
-            hinted_media_playing: false,
         };
 
         assert_eq!(meta.urgency(), FlowUrgency::Stale);
@@ -923,9 +821,6 @@ mod tests {
             continuation_credit: 3,
             demotable: true,
             reclaimable: true,
-            hinted_generation: None,
-            hinted_visible: false,
-            hinted_media_playing: false,
         };
 
         assert_eq!(meta.urgency(), FlowUrgency::Sustained);
@@ -1025,61 +920,4 @@ mod tests {
         assert_eq!(meta.stats.window_bytes_submitted, 4096);
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // tests: VisibilityHint / apply_hint
-    // ─────────────────────────────────────────────────────────────────────────
-
-    /// FlowVisible sets hinted_visible on the target flow.
-    #[test]
-    fn test_apply_hint_flow_visible() {
-        let bps = Arc::new(AtomicU64::new(0));
-        let mut sched = Scheduler::new(bps);
-
-        let flow = FlowId(1);
-        sched.init_flow(flow, FlowClass::InteractiveObject, None, false);
-
-        sched.apply_hint(VisibilityHint::FlowVisible { flow_id: flow, generation: 7 });
-
-        let meta = sched.flow_meta_mut(flow).unwrap();
-        assert!(meta.hinted_visible, "hinted_visible should be true after FlowVisible");
-        assert_eq!(meta.hinted_generation, Some(7));
-    }
-
-    /// MediaPlaying floors continuation_credit at 4.
-    #[test]
-    fn test_apply_hint_media_playing_floors_credit() {
-        let bps = Arc::new(AtomicU64::new(0));
-        let mut sched = Scheduler::new(bps);
-
-        let flow = FlowId(2);
-        sched.init_flow(flow, FlowClass::StreamingMedia, None, false);
-
-        sched.apply_hint(VisibilityHint::MediaPlaying { flow_id: flow });
-
-        let meta = sched.flow_meta_mut(flow).unwrap();
-        assert!(meta.hinted_media_playing);
-        assert!(
-            meta.continuation_credit >= 4,
-            "credit should be >= 4 after MediaPlaying, got {}",
-            meta.continuation_credit
-        );
-    }
-
-    /// GenerationObsolete reclaims budget for affected flows.
-    #[test]
-    fn test_apply_hint_generation_obsolete_reclaims() {
-        let bps = Arc::new(AtomicU64::new(0));
-        let mut sched = Scheduler::new(bps);
-
-        let flow = FlowId(3);
-        sched.init_flow(flow, FlowClass::InteractiveObject, None, false);
-        sched.apply_hint(VisibilityHint::FlowVisible { flow_id: flow, generation: 99 });
-
-        // Apply GenerationObsolete — should reclaim budget and clear hints.
-        sched.apply_hint(VisibilityHint::GenerationObsolete { generation: 99 });
-
-        let meta = sched.flow_meta_mut(flow).unwrap();
-        assert!(!meta.hinted_visible);
-        assert_eq!(meta.hinted_generation, None);
-    }
 }

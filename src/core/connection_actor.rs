@@ -11,16 +11,13 @@
 ///   - FlowClosed cleanup (on_flow_close in Scheduler).
 ///   - Periodic tick for Scheduler maintenance (reclassification, credits, reclaim).
 ///   - GracefulDrain / Shutdown lifecycle.
-///   - ApplyHint forwarding.
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use bytes::Bytes;
 use tokio::sync::mpsc;
 
-use crate::core::scheduler::{
-    FlowId, Scheduler, VisibilityHint,
-};
+use crate::core::scheduler::{FlowId, Scheduler};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ConnControl — messages from flow actors to ConnectionActor
@@ -40,8 +37,6 @@ pub(crate) enum ConnControl {
     /// Stop accepting new streams; exit on next tick.
     GracefulDrain,
 
-    /// Forward a client cooperation hint to the scheduler.
-    ApplyHint(VisibilityHint),
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -132,9 +127,6 @@ impl ConnectionActor {
             }
             ConnControl::GracefulDrain => {
                 self.draining = true;
-            }
-            ConnControl::ApplyHint(hint) => {
-                self.scheduler.lock().unwrap().apply_hint(hint);
             }
         }
         true
