@@ -8,6 +8,7 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use netstack_smoltcp::{StackBuilder, UdpSocket};
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio_util::task::TaskTracker;
 use tokio::sync::{Mutex, mpsc};
 use tun_rs::DeviceBuilder;
 
@@ -59,7 +60,7 @@ pub trait EventLogger: Send + Sync {
 
 #[async_trait::async_trait]
 pub trait TunBackend: Send + Sync {
-    async fn run(self: Arc<Self>, server: Arc<TunServer>) -> io::Result<()>;
+    async fn run(self: Arc<Self>, server: Arc<TunServer>, tracker: TaskTracker) -> io::Result<()>;
 }
 
 #[derive(Default)]
@@ -67,7 +68,7 @@ struct NetstackTunBackend;
 
 #[async_trait::async_trait]
 impl TunBackend for NetstackTunBackend {
-    async fn run(self: Arc<Self>, server: Arc<TunServer>) -> io::Result<()> {
+    async fn run(self: Arc<Self>, server: Arc<TunServer>, tracker: TaskTracker) -> io::Result<()> {
         let tun_device = build_tun_device(&server.config)?;
         let (stack, runner, udp_socket, tcp_listener) = StackBuilder::default()
             .enable_tcp(true)
@@ -118,10 +119,11 @@ impl TunBackend for NetstackTunBackend {
 
         let tcp_loop = {
             let server = Arc::clone(&server);
+            let tcp_tracker = tracker.clone();
             tokio::spawn(async move {
                 while let Some((stream, src, dst)) = tcp_listener.next().await {
                     let server = Arc::clone(&server);
-                    tokio::spawn(async move {
+                    tcp_tracker.spawn(async move {
                         let _ = server
                             .handle_tun_tcp(stream, src.to_string(), dst.to_string())
                             .await;
@@ -177,9 +179,9 @@ pub struct TunServer {
 }
 
 impl TunServer {
-    pub async fn serve(self: Arc<Self>) -> io::Result<()> {
+    pub async fn serve(self: Arc<Self>, tracker: TaskTracker) -> io::Result<()> {
         if let Some(backend) = &self.backend {
-            return Arc::clone(backend).run(Arc::clone(&self)).await;
+            return Arc::clone(backend).run(Arc::clone(&self), tracker).await;
         }
 
         Err(io::Error::new(

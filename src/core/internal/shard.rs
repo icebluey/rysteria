@@ -8,8 +8,13 @@
 ///
 /// Connections are mapped via `conn_id % shard_count` — the same `ConnId`
 /// always resolves to the same shard handle.
+///
+/// Built on top of `RyRuntime::new_no_steal()` to avoid duplicating the
+/// runtime-creation and lifecycle-management logic.
 use std::sync::Arc;
-use tokio::runtime::{Builder, Handle};
+use tokio::runtime::Handle;
+
+use crate::core::internal::runtime::RyRuntime;
 
 /// Opaque u64 connection identifier. Generated once per authenticated connection.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -18,6 +23,8 @@ pub struct ConnId(pub u64);
 /// Pool of single-threaded Tokio runtimes, each pinned to its own OS thread.
 pub struct ShardPool {
     handles: Arc<Vec<Handle>>,
+    /// Owns the `RyRuntime` instances; dropping them signals each shard to exit.
+    _runtimes: Vec<RyRuntime>,
 }
 
 impl ShardPool {
@@ -30,22 +37,18 @@ impl ShardPool {
             return Err("shard count must be > 0".into());
         }
         let mut handles = Vec::with_capacity(threads);
+        let mut runtimes = Vec::with_capacity(threads);
+
         for i in 0..threads {
-            let rt = Builder::new_current_thread()
-                .enable_all()
-                .thread_name(format!("ry-shard-{i}"))
-                .build()?;
-            let handle = rt.handle().clone();
-            std::thread::Builder::new()
-                .name(format!("ry-shard-{i}"))
-                .spawn(move || {
-                    // Block the OS thread on a never-resolving future.
-                    // All tasks spawned on this handle run cooperatively here.
-                    rt.block_on(std::future::pending::<()>());
-                })?;
-            handles.push(handle);
+            let rt = RyRuntime::new_no_steal(&format!("ry-shard-{i}"))?;
+            handles.push(rt.handle().clone());
+            runtimes.push(rt);
         }
-        Ok(Self { handles: Arc::new(handles) })
+
+        Ok(Self {
+            handles: Arc::new(handles),
+            _runtimes: runtimes,
+        })
     }
 
     /// Return the runtime handle for the shard that owns `conn_id`.

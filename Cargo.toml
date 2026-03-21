@@ -28,7 +28,8 @@ h3-quinn = { version = "0.0.10" }
 
 # Config parsing
 serde = { version = "1", features = ["derive"] }
-serde-saphyr = { version = "0.0.21" }
+serde-saphyr = { version = "0.0.22" }
+toml = { version = "1.0.7", default-features = false, features = ["std", "serde", "parse"] }
 serde_json = { version = "1" }
 url = { version = "2" }
 
@@ -52,7 +53,7 @@ http = { version = "1" }
 
 # Byte buffers
 bytes = { version = "1" }
-tokio-util = { version = "0.7" }
+tokio-util = { version = "0.7", features = ["rt"] }
 futures-util = { version = "0.3" }
 regex = { version = "1" }
 geoip2 = { version = "0.1.8" }
@@ -89,6 +90,7 @@ tower-http = { version = "0.6", features = ["fs"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 hex = { version = "0.4" }
 rcgen = { version = "0.14" }
+quinn = { version = "0.11", default-features = false }
 
 [profile.release]
 # Strip symbol tables from the release binary.

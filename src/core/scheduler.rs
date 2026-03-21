@@ -40,9 +40,7 @@ pub struct UdpSessionId(pub u32);
 
 /// Traffic class — determines PermitBank class budget selection.
 ///
-/// Five classes (highest priority first):
-///   RealtimeDatagram > Control > InteractiveObject > StreamingMedia > Bulk
-///
+/// Three classes: RealtimeDatagram (UDP), Control (port-based), Bulk (everything else).
 /// Class affects which class-level budget pool a permit is drawn from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FlowClass {
@@ -50,24 +48,34 @@ pub enum FlowClass {
     /// Port hints: 53 (DNS), 22 (SSH), 23 (Telnet), 3389 (RDP).
     Control,
 
-    /// Short-lived, small-byte-count TCP flows (web objects, API calls).
-    /// Heuristic: total_bytes < 128 KiB AND lifetime < 1500 ms.
-    InteractiveObject,
-
-    /// Long-lived, periodically progressing TCP flows (video, audio streams).
-    /// Heuristic: lifetime > 2s AND sustained_progress AND periodic_progress.
-    /// Gets continuation_credit bonus.
-    StreamingMedia,
-
-    /// Large downloads, uploads, sync, mirror pulls.
-    /// Heuristic: total_bytes > 4 MiB.
-    /// Lowest TCP priority; eats remaining bandwidth but never starves others.
+    /// All TCP proxy traffic: downloads, uploads, web objects, video streams.
+    /// Default class for all non-port-based, non-datagram flows.
     Bulk,
 
     /// UDP relay: games, VoIP, DNS-over-UDP. Strict highest priority.
     /// Separate budget. Small quantum matches datagram MTU (~1200 bytes).
     RealtimeDatagram,
 }
+
+/// Pending-permit queue tier for priority-ordered flush.
+///
+/// Determines which pending queue a permit request is routed to.
+/// Flush order: Control → Interactive → Bulk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QueueTier {
+    /// Port-based Control flows (DNS, SSH, RDP). Highest flush priority.
+    Control,
+    /// Early-interactive flows, RealtimeDatagram.
+    Interactive,
+    /// Bulk flows.
+    Bulk,
+}
+
+// Early-interactive window thresholds: new TCP flows route to the Interactive
+// pending queue until either threshold is met. Budget class is NOT overridden;
+// flows draw from their actual FlowClass budget (typically Bulk, 16 MiB).
+const EARLY_INTERACTIVE_BYTES: u64 = 128 * 1024;
+const EARLY_INTERACTIVE_DURATION: Duration = Duration::from_millis(1500);
 
 /// Per-flow scheduling hints attached to every permit request.
 ///
@@ -99,6 +107,12 @@ impl FlowHints {
     /// Hints for UDP relay sessions (highest scheduling priority).
     pub fn realtime() -> Self {
         Self { class: FlowClass::RealtimeDatagram, dest_port: None, is_datagram_ingress: true }
+    }
+
+    /// Hints for control-plane operations (auth, reconnect, keepalive).
+    /// Uses FlowClass::Control budget without port-based classification.
+    pub fn control() -> Self {
+        Self { class: FlowClass::Control, dest_port: None, is_datagram_ingress: false }
     }
 }
 
@@ -195,17 +209,12 @@ impl FlowStats {
 
 /// Per-flow scheduling metadata tracked in `Scheduler::flow_meta`.
 ///
-/// Combines classification state, continuation credit,
-/// and urgency tracking. Also includes hint fields.
+/// Combines classification state and urgency tracking.
 pub struct FlowMeta {
     pub flow_id: FlowId,
     /// Current traffic class (may differ from initial hints after reclassification).
     pub class: FlowClass,
     pub stats: FlowStats,
-
-    /// Scheduling bonus for sustained-progress StreamingMedia flows.
-    /// Range [0, 8]. Accumulated while stable_rounds >= 3; decays on idle.
-    pub continuation_credit: u8,
 
     /// True if this flow can be demoted when Stale.
     /// Datagram flows are not demotable.
@@ -214,6 +223,12 @@ pub struct FlowMeta {
     /// True if permits held by this flow can be partially reclaimed when idle.
     /// Datagram flows are not reclaimable.
     pub reclaimable: bool,
+
+    /// True during the early-interactive window (first 128 KiB or 1500 ms).
+    /// While active, the flow routes to the Interactive pending queue
+    /// regardless of its actual FlowClass, giving new flows higher priority
+    /// when budget is contended. Datagram flows are never early-interactive.
+    pub is_early_interactive: bool,
 }
 
 impl FlowMeta {
@@ -222,9 +237,9 @@ impl FlowMeta {
             flow_id,
             class,
             stats: FlowStats::new(dest_port, is_datagram),
-            continuation_credit: 0,
             demotable: !is_datagram,
             reclaimable: !is_datagram,
+            is_early_interactive: !is_datagram,
         }
     }
 
@@ -266,24 +281,7 @@ fn reclassify(meta: &FlowMeta) -> FlowClass {
         }
     }
 
-    let lifetime_ms = s.created_at.elapsed().as_millis() as u64;
-
-    // Short-lived, small flows -> InteractiveObject.
-    if s.total_bytes_submitted < 128 * 1024 && lifetime_ms < 1500 {
-        return FlowClass::InteractiveObject;
-    }
-
-    // Long-lived, periodic, sustained -> StreamingMedia.
-    if lifetime_ms > 2000 && s.periodic_progress && s.sustained_progress {
-        return FlowClass::StreamingMedia;
-    }
-
-    // Large total bytes -> Bulk.
-    if s.total_bytes_submitted > 4 * 1024 * 1024 {
-        return FlowClass::Bulk;
-    }
-
-    // Uncertain: keep current class to avoid thrashing.
+    // All non-datagram, non-port-based flows stay in their current class.
     meta.class
 }
 
@@ -293,28 +291,6 @@ fn classify_by_port(port: u16) -> Option<FlowClass> {
         53 => Some(FlowClass::Control),              // DNS
         22 | 23 | 3389 => Some(FlowClass::Control), // SSH, Telnet, RDP
         _ => None,
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// continuation_credit update
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Update continuation credits for all flows.
-///
-/// Called from `Scheduler::tick()`.
-/// Only StreamingMedia flows accumulate credit (max 8).
-/// Credit decays by 1 for any flow with idle_rounds > 0.
-/// MediaPlaying hint can floor the credit at 4.
-fn update_continuation_credits(flow_meta: &mut HashMap<FlowId, FlowMeta>) {
-    for meta in flow_meta.values_mut() {
-        if meta.class == FlowClass::StreamingMedia && meta.stats.stable_rounds >= 3 {
-            // Sustained progress in StreamingMedia: grant credit (capped at 8).
-            meta.continuation_credit = (meta.continuation_credit + 1).min(8);
-        } else if meta.stats.idle_rounds > 0 {
-            // Any idle round decays credit by 1.
-            meta.continuation_credit = meta.continuation_credit.saturating_sub(1);
-        }
     }
 }
 
@@ -402,11 +378,9 @@ impl ByteBudget {
 ///
 /// Class budgets:
 ///   Control:            1 MiB  — small, rarely saturated
-///   InteractiveObject:  4 MiB  — many small concurrent objects
-///   StreamingMedia:     8 MiB  — sustained media feed
-///   Bulk:              16 MiB  — large transfers
+///   Bulk:              30 MiB  — all TCP proxy traffic
 ///   RealtimeDatagram: 512 KiB  — latency-critical, low volume
-///   Total connection:  32 MiB  — unchanged from original
+///   Total connection:  32 MiB
 pub struct PermitBank {
     conn_budget: ByteBudget,
     class_budget: HashMap<FlowClass, ByteBudget>,
@@ -418,9 +392,7 @@ impl PermitBank {
     pub fn new(conn_bytes: usize) -> Self {
         let mut class_budget = HashMap::new();
         class_budget.insert(FlowClass::Control, ByteBudget::new(1 * 1024 * 1024));
-        class_budget.insert(FlowClass::InteractiveObject, ByteBudget::new(4 * 1024 * 1024));
-        class_budget.insert(FlowClass::StreamingMedia, ByteBudget::new(8 * 1024 * 1024));
-        class_budget.insert(FlowClass::Bulk, ByteBudget::new(16 * 1024 * 1024));
+        class_budget.insert(FlowClass::Bulk, ByteBudget::new(30 * 1024 * 1024));
         class_budget.insert(FlowClass::RealtimeDatagram, ByteBudget::new(512 * 1024));
         Self {
             conn_budget: ByteBudget::new(conn_bytes),
@@ -498,9 +470,10 @@ impl PermitBank {
 
     /// Shrink a stale flow's per-flow budget.
     ///
-    /// Only shrinks `available` (unissued credit), never touches already-issued permits.
-    /// The reclaimed capacity is NOT returned to conn_budget or class_budget
-    /// because the flow_budget was created independently.
+    /// Only shrinks `available` (unissued credit), never touches `capacity`.
+    /// Leaving `capacity` intact ensures the flow can recover to full speed
+    /// after permits are returned, preventing a low-bandwidth deadlock where
+    /// capacity falls below the minimum chunk size.
     pub fn reclaim_from_flow(&mut self, flow_id: FlowId, _class: FlowClass, bytes: usize) {
         if let Some(fb) = self.flow_budget.get_mut(&flow_id) {
             let actual = bytes.min(fb.available);
@@ -508,7 +481,9 @@ impl PermitBank {
                 return;
             }
             fb.available -= actual;
-            fb.capacity -= actual;
+            // Intentionally not reducing capacity: capacity must stay at its
+            // original value so give_back() can restore full credit when
+            // outstanding permits are returned.
         }
     }
 
@@ -557,6 +532,30 @@ impl Scheduler {
         }
     }
 
+    /// Create a Scheduler with a custom connection budget (for testing).
+    #[cfg(test)]
+    pub fn new_with_budget(conn_bytes: usize, effective_bps: Arc<AtomicU64>) -> Self {
+        Self {
+            permits: PermitBank::new(conn_bytes),
+            flow_meta: HashMap::new(),
+            effective_bps,
+        }
+    }
+
+    /// Try to acquire a control-plane permit (no FlowMeta tracking).
+    ///
+    /// Control leases use synthetic flow IDs for budget return identification
+    /// but do not need FlowMeta (no reclassification, no continuation credits,
+    /// no reclaim). The permit is always drawn from FlowClass::Control budget.
+    pub fn try_acquire_control_permit(
+        &mut self,
+        conn_id: ConnId,
+        flow_id: FlowId,
+        bytes: usize,
+    ) -> Option<Permit> {
+        self.permits.try_acquire(conn_id, Some(flow_id), FlowClass::Control, bytes)
+    }
+
     /// Try to acquire a send permit.
     ///
     /// Uses the flow's current class from flow_meta when the flow is known
@@ -580,6 +579,8 @@ impl Scheduler {
                     hints.is_datagram_ingress,
                 )
             });
+            // Early-interactive only affects queue routing (queue_tier()),
+            // not budget class. Flows draw from their actual class budget.
             meta.class
         } else {
             hints.class
@@ -602,6 +603,12 @@ impl Scheduler {
                 if sent > 0 {
                     meta.stats.last_activity_at = Instant::now();
                     meta.stats.last_progress_at = Instant::now();
+                }
+                // Check bytes-based early-interactive exit eagerly.
+                if meta.is_early_interactive
+                    && meta.stats.total_bytes_submitted >= EARLY_INTERACTIVE_BYTES
+                {
+                    meta.is_early_interactive = false;
                 }
             }
         }
@@ -660,10 +667,22 @@ impl Scheduler {
             self.reclassify_flow(fid, old_class, new_class);
         }
 
-        // Step 4: update continuation credits.
-        update_continuation_credits(&mut self.flow_meta);
+        // Step 3.5: check time-based early-interactive exit.
+        // Only exit when the flow has actually submitted data. A flow still
+        // waiting for its first server response (total_bytes_submitted == 0)
+        // has not started transferring data, so keeping it in
+        // early-interactive is zero-cost and ensures its first bytes get
+        // priority treatment.
+        for meta in self.flow_meta.values_mut() {
+            if meta.is_early_interactive
+                && meta.stats.total_bytes_submitted > 0
+                && meta.stats.created_at.elapsed() >= EARLY_INTERACTIVE_DURATION
+            {
+                meta.is_early_interactive = false;
+            }
+        }
 
-        // Step 5: reclaim permits from idle/stale flows.
+        // Step 4: reclaim permits from idle/stale flows.
         reclaim_stale_permits(&mut self.flow_meta, &mut self.permits);
     }
 
@@ -673,6 +692,29 @@ impl Scheduler {
             meta.class = new_class;
         }
         self.permits.transfer_flow_class(flow_id, old_class, new_class);
+    }
+
+    /// Determine which pending-permit queue tier a flow belongs to.
+    ///
+    /// Queue flush order: Control → Interactive → Bulk.
+    /// During early-interactive, the flow routes to Interactive regardless of
+    /// its FlowClass, unless reclassify has already promoted it to Control
+    /// (prevents priority inversion for port-53/22/23/3389 flows).
+    pub fn queue_tier(&self, flow_id: FlowId) -> QueueTier {
+        if let Some(meta) = self.flow_meta.get(&flow_id) {
+            // Control class overrides early-interactive (higher priority queue).
+            if meta.is_early_interactive && meta.class != FlowClass::Control {
+                return QueueTier::Interactive;
+            }
+            match meta.class {
+                FlowClass::Control => QueueTier::Control,
+                FlowClass::RealtimeDatagram => QueueTier::Interactive,
+                FlowClass::Bulk => QueueTier::Bulk,
+            }
+        } else {
+            // FlowMeta not yet created (before first try_issue_permit).
+            QueueTier::Interactive
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -689,6 +731,11 @@ impl Scheduler {
         self.flow_meta.get(&flow_id).map(|m| m.class)
     }
 
+    #[cfg(test)]
+    pub fn is_early_interactive(&self, flow_id: FlowId) -> bool {
+        self.flow_meta.get(&flow_id).map(|m| m.is_early_interactive).unwrap_or(false)
+    }
+
     /// Initialize FlowMeta for a flow (test helper).
     /// In production, FlowMeta is initialized by try_issue_permit on first call.
     #[cfg(test)]
@@ -697,6 +744,7 @@ impl Scheduler {
             FlowMeta::new(flow_id, class, dest_port, is_datagram)
         });
     }
+
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -714,14 +762,12 @@ mod tests {
 
     /// Verify PermitBank correctly initializes 5-class budgets.
     #[test]
-    fn test_permit_bank_five_classes() {
+    fn test_permit_bank_three_classes() {
         let conn_id = ConnId(0);
         let mut bank = PermitBank::new(32 * 1024 * 1024);
 
         let classes = [
             FlowClass::Control,
-            FlowClass::InteractiveObject,
-            FlowClass::StreamingMedia,
             FlowClass::Bulk,
             FlowClass::RealtimeDatagram,
         ];
@@ -742,49 +788,6 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // tests: continuation_credit
-    // ─────────────────────────────────────────────────────────────────────────
-
-    /// Verify that continuation_credit accumulates for StreamingMedia flows
-    /// with stable_rounds >= 3.
-    #[test]
-    fn test_continuation_credit_accumulation() {
-        let bps = Arc::new(AtomicU64::new(0));
-        let mut sched = Scheduler::new(bps);
-
-        // Initialize FlowMeta directly.
-        sched.init_flow(FlowId(20), FlowClass::StreamingMedia, None, false);
-
-        {
-            let meta = sched.flow_meta_mut(FlowId(20)).unwrap();
-            meta.stats.stable_rounds = 5;
-            meta.stats.window_bytes_progressed = 1024;
-            // Set total_bytes > 128 KiB so reclassify() does not demote to InteractiveObject.
-            meta.stats.total_bytes_submitted = 200 * 1024;
-        }
-
-        sched.tick();
-
-        let meta = sched.flow_meta_mut(FlowId(20)).unwrap();
-        assert!(meta.continuation_credit >= 1, "Expected credit >= 1, got {}", meta.continuation_credit);
-    }
-
-    /// Verify that continuation_credit decays when the flow becomes idle.
-    #[test]
-    fn test_continuation_credit_decay_on_idle() {
-        let mut flow_meta: HashMap<FlowId, FlowMeta> = HashMap::new();
-        let mut meta = FlowMeta::new(FlowId(30), FlowClass::StreamingMedia, None, false);
-        meta.continuation_credit = 6;
-        meta.stats.idle_rounds = 2;
-        flow_meta.insert(FlowId(30), meta);
-
-        update_continuation_credits(&mut flow_meta);
-
-        let credit = flow_meta[&FlowId(30)].continuation_credit;
-        assert_eq!(credit, 5, "Credit should decay by 1 on idle, got {}", credit);
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
     // tests: stale demotion + permit reclaim
     // ─────────────────────────────────────────────────────────────────────────
 
@@ -799,9 +802,9 @@ mod tests {
                 total_bytes_submitted: 1024,
                 ..FlowStats::new(None, false)
             },
-            continuation_credit: 0,
             demotable: true,
             reclaimable: true,
+            is_early_interactive: false,
         };
 
         assert_eq!(meta.urgency(), FlowUrgency::Stale);
@@ -812,15 +815,15 @@ mod tests {
     fn test_flow_urgency_sustained() {
         let meta = FlowMeta {
             flow_id: FlowId(41),
-            class: FlowClass::StreamingMedia,
+            class: FlowClass::Bulk,
             stats: FlowStats {
                 stable_rounds: 5,
                 total_bytes_submitted: 1024 * 1024,
                 ..FlowStats::new(None, false)
             },
-            continuation_credit: 3,
             demotable: true,
             reclaimable: true,
+            is_early_interactive: false,
         };
 
         assert_eq!(meta.urgency(), FlowUrgency::Sustained);
@@ -861,29 +864,6 @@ mod tests {
     // tests: dynamic reclassification
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// Verify that a flow with > 4 MiB submitted gets reclassified to Bulk.
-    #[test]
-    fn test_reclassification_to_bulk() {
-        let bps = Arc::new(AtomicU64::new(0));
-        let mut sched = Scheduler::new(bps);
-
-        sched.init_flow(FlowId(60), FlowClass::InteractiveObject, None, false);
-
-        {
-            let meta = sched.flow_meta_mut(FlowId(60)).unwrap();
-            meta.stats.total_bytes_submitted = 5 * 1024 * 1024;
-            meta.stats.window_bytes_progressed = 1024;
-        }
-
-        sched.tick();
-
-        assert_eq!(
-            sched.flow_class(FlowId(60)),
-            Some(FlowClass::Bulk),
-            "Flow should be reclassified to Bulk after exceeding 4 MiB"
-        );
-    }
-
     /// Verify that port 53 flows are classified as Control.
     #[test]
     fn test_port_based_classification_dns() {
@@ -918,6 +898,409 @@ mod tests {
         assert_eq!(meta.stats.window_bytes_progressed, 4096);
         assert_eq!(meta.stats.total_bytes_submitted, 4096);
         assert_eq!(meta.stats.window_bytes_submitted, 4096);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Regression proof tests (scheduler unit level)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// R02 (unit): Permit budget is fully conserved after repeated issue+release cycles.
+    ///
+    /// Proves Rule 2: permits model in-flight occupancy, not total quota.
+    /// If release() treated permits as "burned" bytes rather than returning
+    /// them to the pool, the budget would deplete after enough cycles and
+    /// try_acquire() would return None even when nothing is actually in flight.
+    #[test]
+    fn regression_02_permit_budget_conserved_after_cycles() {
+        let mut bank = PermitBank::new(4 * 1024 * 1024);
+        let conn_id = ConnId(0);
+        let flow_id = FlowId(200);
+
+        // 50 issue+release cycles: budget must never deplete.
+        for round in 0u32..50 {
+            let p = bank.try_acquire(conn_id, Some(flow_id), FlowClass::Bulk, 32 * 1024);
+            assert!(
+                p.is_some(),
+                "round {round}: budget should be available after each release"
+            );
+            bank.release(p.unwrap(), 32 * 1024);
+        }
+
+        // Final permit must also succeed: budget fully conserved.
+        let p = bank.try_acquire(conn_id, Some(flow_id), FlowClass::Bulk, 1024);
+        assert!(p.is_some(), "Budget must be fully conserved after 50 cycles (R02)");
+    }
+
+    /// R03 (unit): Forward progress is possible after stale reclaim + permit release.
+    ///
+    /// Proves Rule 4: reclaim_from_flow() only reduces available, not capacity.
+    /// After reclaim drains available to zero, releasing an outstanding permit
+    /// calls give_back() which restores credit (capped at capacity, not at the
+    /// reclaimed available). Without this invariant, the flow enters a permanent
+    /// deadlock where available stays at zero even after releases.
+    #[test]
+    fn regression_03_forward_progress_after_reclaim_and_release() {
+        let mut bank = PermitBank::new(32 * 1024 * 1024);
+        let conn_id = ConnId(0);
+        let flow_id = FlowId(201);
+
+        // Issue a permit to initialize the flow budget entry.
+        let permit = bank
+            .try_acquire(conn_id, Some(flow_id), FlowClass::Bulk, 256 * 1024)
+            .expect("Initial permit must succeed");
+
+        // Simulate stale reclaim: drain all remaining available budget.
+        let remaining = bank.flow_budget_available(flow_id);
+        if remaining > 0 {
+            bank.reclaim_from_flow(flow_id, FlowClass::Bulk, remaining);
+        }
+        assert_eq!(
+            bank.flow_budget_available(flow_id),
+            0,
+            "After full reclaim, available must be 0"
+        );
+
+        // Release the outstanding permit. give_back() must restore credit because
+        // capacity is unchanged by reclaim.
+        bank.release(permit, 256 * 1024);
+
+        let available_after = bank.flow_budget_available(flow_id);
+        assert!(
+            available_after > 0,
+            "After release following reclaim, budget must recover (capacity unchanged): got {available_after}"
+        );
+
+        // Prove forward progress: a new permit must be issuable.
+        let p2 = bank.try_acquire(conn_id, Some(flow_id), FlowClass::Bulk, 1024);
+        assert!(
+            p2.is_some(),
+            "Forward progress must be possible after reclaim+release cycle (R03, Rule 4)"
+        );
+    }
+
+    /// R08 (unit): Budget is returned to all levels after on_send_complete,
+    /// enabling subsequent permit requests to succeed.
+    ///
+    /// Proves that on_send_complete() properly credits conn, class, and flow
+    /// budget pools, so a waiting task can acquire a permit immediately after
+    /// a send completes. This is the precondition for the ConnectionActor's
+    /// pending-permit flush to work correctly (Rule 5 — event-driven wakeup).
+    #[test]
+    fn regression_08_notify_fires_on_send_complete() {
+        let bps = Arc::new(AtomicU64::new(0));
+        let mut sched = Scheduler::new(bps);
+
+        let hints = FlowHints { class: FlowClass::Bulk, dest_port: None, is_datagram_ingress: false };
+        let permit = sched
+            .try_issue_permit(ConnId(0), Some(FlowId(202)), &hints, 1024)
+            .expect("Permit must be issued");
+
+        sched.on_send_complete(permit, 1024);
+
+        // After on_send_complete, budget must be restored — a new permit succeeds.
+        let p2 = sched.try_issue_permit(ConnId(0), Some(FlowId(202)), &hints, 1024);
+        assert!(
+            p2.is_some(),
+            "Budget must be returned after on_send_complete so pending permits can be granted (R08)"
+        );
+    }
+
+    /// R10 (unit): Cancel path (0 bytes sent) returns budget without leaking.
+    ///
+    /// Proves cancel-safety: calling on_send_complete(permit, 0) — the cancel
+    /// path used when a task is cancelled before completing the write — returns
+    /// the full credit to the pool without updating bytes_sent. Without this,
+    /// every cancellation permanently leaks permit budget until the connection
+    /// budget collapses.
+    #[test]
+    fn regression_10_permit_guard_drop_releases_with_zero_bytes() {
+        let bps = Arc::new(AtomicU64::new(0));
+        let mut sched = Scheduler::new(bps);
+
+        let hints = FlowHints { class: FlowClass::Bulk, dest_port: None, is_datagram_ingress: false };
+        let permit = sched
+            .try_issue_permit(ConnId(0), Some(FlowId(203)), &hints, 1024)
+            .expect("Permit must be issued");
+
+        // Cancel path: return permit with 0 bytes sent.
+        sched.on_send_complete(permit, 0);
+
+        // Verify: total_bytes_sent is still 0 (no forward progress on cancel).
+        let sent = sched
+            .flow_meta_mut(FlowId(203))
+            .map(|m| m.stats.total_bytes_sent)
+            .unwrap_or(0);
+        assert_eq!(sent, 0, "Cancel path must not update bytes_sent (R10)");
+
+        // Verify: a new permit can be issued (budget was returned, not leaked).
+        let p2 = sched.try_issue_permit(ConnId(0), Some(FlowId(203)), &hints, 1024);
+        assert!(
+            p2.is_some(),
+            "After cancel (0 bytes), budget must be returned so new permits are issuable (R10)"
+        );
+    }
+
+    /// Control class budget survives full data-plane class exhaustion.
+    ///
+    /// Proves that auth, reconnect, and keepalive control leases can always
+    /// be acquired from the reserved 1 MiB Control budget even when all
+    /// data-plane class budgets (Bulk, RealtimeDatagram) are fully saturated
+    /// by in-flight permits.
+    #[test]
+    fn test_control_budget_survives_data_plane_exhaustion() {
+        let mut bank = PermitBank::new(100 * 1024 * 1024);
+        let conn_id = ConnId(0);
+
+        // Exhaust all data-plane class budgets.
+        let _bulk = bank.try_acquire(conn_id, None, FlowClass::Bulk, 30 * 1024 * 1024).unwrap();
+        let _udp = bank.try_acquire(conn_id, None, FlowClass::RealtimeDatagram, 512 * 1024).unwrap();
+
+        // Auth control lease (8 KiB) must still succeed.
+        let ctrl_auth = bank.try_acquire(conn_id, None, FlowClass::Control, 8 * 1024);
+        assert!(ctrl_auth.is_some(), "Auth control lease (8 KiB) must succeed under full data-plane saturation");
+
+        // Reconnect control lease (16 KiB) must also succeed.
+        let ctrl_reconnect = bank.try_acquire(conn_id, None, FlowClass::Control, 16 * 1024);
+        assert!(ctrl_reconnect.is_some(), "Reconnect control lease (16 KiB) must succeed under full data-plane saturation");
+    }
+
+    /// R13 (unit): RealtimeDatagram budget is fully independent of TCP class budgets.
+    ///
+    /// Proves Rule 9 and Regression 13: exhausting the Bulk TCP class budget
+    /// must not affect UDP relay permits. The three class budgets are separate
+    /// ByteBudget pools; only the shared conn-level budget can create
+    /// cross-class contention.
+    #[test]
+    fn regression_13_datagram_budget_independent_of_tcp_classes() {
+        // Use a large conn budget so it doesn't become the constraint.
+        let mut bank = PermitBank::new(100 * 1024 * 1024);
+        let conn_id = ConnId(0);
+
+        // Exhaust the entire Bulk class budget (30 MiB).
+        let bulk_p =
+            bank.try_acquire(conn_id, None, FlowClass::Bulk, 30 * 1024 * 1024);
+        assert!(bulk_p.is_some(), "Must be able to exhaust Bulk budget");
+
+        // Bulk is now fully exhausted — no more Bulk permits possible.
+        let blocked = bank.try_acquire(conn_id, None, FlowClass::Bulk, 1);
+        assert!(blocked.is_none(), "Bulk budget must be fully exhausted (R13)");
+
+        // Despite Bulk being saturated, UDP must still be available.
+        let udp_p = bank.try_acquire(conn_id, None, FlowClass::RealtimeDatagram, 1024);
+        assert!(
+            udp_p.is_some(),
+            "RealtimeDatagram budget must be independent of TCP class budgets (R13, Rule 9)"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // tests: early-interactive window
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// New TCP flow gets is_early_interactive = true on first permit request.
+    #[test]
+    fn test_early_interactive_set_on_tcp_flow() {
+        let bps = Arc::new(AtomicU64::new(0));
+        let mut sched = Scheduler::new(bps);
+
+        let hints = FlowHints::default_tcp();
+        let _permit = sched.try_issue_permit(ConnId(0), Some(FlowId(300)), &hints, 1024);
+
+        assert!(
+            sched.is_early_interactive(FlowId(300)),
+            "New TCP flow must have is_early_interactive = true"
+        );
+    }
+
+    /// Datagram flows do NOT get early-interactive.
+    #[test]
+    fn test_early_interactive_not_set_on_datagram() {
+        let bps = Arc::new(AtomicU64::new(0));
+        let mut sched = Scheduler::new(bps);
+
+        let hints = FlowHints::realtime();
+        let _permit = sched.try_issue_permit(ConnId(0), Some(FlowId(301)), &hints, 1024);
+
+        assert!(
+            !sched.is_early_interactive(FlowId(301)),
+            "Datagram flow must NOT have is_early_interactive"
+        );
+    }
+
+    /// Early-interactive does NOT override budget class — flow draws from its
+    /// actual class budget (Bulk). When Bulk is exhausted, early-interactive
+    /// flow is also blocked, but routes to Interactive pending queue for
+    /// higher priority when budget is freed.
+    #[test]
+    fn test_early_interactive_no_budget_override() {
+        let bps = Arc::new(AtomicU64::new(0));
+        let mut sched = Scheduler::new_with_budget(100 * 1024 * 1024, bps);
+
+        // Exhaust Bulk class budget (30 MiB) using flow_id=None to bypass per-flow limit.
+        let bulk_hints = FlowHints { class: FlowClass::Bulk, dest_port: None, is_datagram_ingress: false };
+        let bulk_permit = sched.try_issue_permit(ConnId(0), None, &bulk_hints, 30 * 1024 * 1024);
+        assert!(bulk_permit.is_some(), "Must exhaust Bulk class budget");
+
+        // New TCP flow (early-interactive) also uses Bulk budget — should be blocked.
+        let tcp_hints = FlowHints::default_tcp();
+        let early_permit = sched.try_issue_permit(ConnId(0), Some(FlowId(312)), &tcp_hints, 4096);
+        assert!(
+            early_permit.is_none(),
+            "Early-interactive flow must draw from Bulk budget (exhausted)"
+        );
+
+        // But queue_tier routes it to Interactive for higher priority when pending.
+        assert!(sched.is_early_interactive(FlowId(312)));
+        assert_eq!(sched.queue_tier(FlowId(312)), QueueTier::Interactive);
+    }
+
+    /// Early-interactive exits after 128 KiB of data submitted.
+    #[test]
+    fn test_early_interactive_exits_by_bytes() {
+        let bps = Arc::new(AtomicU64::new(0));
+        let mut sched = Scheduler::new(bps);
+
+        let hints = FlowHints::default_tcp();
+        let permit = sched.try_issue_permit(ConnId(0), Some(FlowId(320)), &hints, 128 * 1024).unwrap();
+
+        assert!(sched.is_early_interactive(FlowId(320)), "Should be early-interactive before send");
+
+        // Complete the send with 128 KiB — this should trigger exit.
+        sched.on_send_complete(permit, 128 * 1024);
+
+        assert!(
+            !sched.is_early_interactive(FlowId(320)),
+            "Early-interactive must exit after 128 KiB submitted"
+        );
+    }
+
+    /// Early-interactive exits after 1500 ms when flow has sent data (checked in tick).
+    #[test]
+    fn test_early_interactive_exits_by_time() {
+        let bps = Arc::new(AtomicU64::new(0));
+        let mut sched = Scheduler::new(bps);
+
+        let hints = FlowHints::default_tcp();
+        let permit = sched.try_issue_permit(ConnId(0), Some(FlowId(321)), &hints, 1024).unwrap();
+
+        assert!(sched.is_early_interactive(FlowId(321)));
+
+        // Complete the send so total_bytes_submitted > 0 (required for time exit).
+        sched.on_send_complete(permit, 1024);
+
+        // Manually backdate created_at to simulate time passing.
+        {
+            let meta = sched.flow_meta_mut(FlowId(321)).unwrap();
+            meta.stats.created_at = Instant::now() - Duration::from_millis(2000);
+            meta.stats.window_bytes_progressed = 1;
+        }
+
+        sched.tick();
+
+        assert!(
+            !sched.is_early_interactive(FlowId(321)),
+            "Early-interactive must exit after 1500 ms when bytes have been sent"
+        );
+    }
+
+    /// Time-based early-interactive exit does NOT fire when total_bytes_submitted == 0.
+    /// Flows waiting for server response have not started transferring data,
+    /// so keeping them in the Interactive pending queue is zero-cost.
+    #[test]
+    fn test_early_interactive_time_exit_requires_bytes() {
+        let bps = Arc::new(AtomicU64::new(0));
+        let mut sched = Scheduler::new(bps);
+
+        let hints = FlowHints::default_tcp();
+        let _permit = sched.try_issue_permit(ConnId(0), Some(FlowId(340)), &hints, 1024);
+
+        assert!(sched.is_early_interactive(FlowId(340)));
+
+        // Backdate past the time threshold, but do NOT complete any sends.
+        {
+            let meta = sched.flow_meta_mut(FlowId(340)).unwrap();
+            meta.stats.created_at = Instant::now() - Duration::from_millis(3000);
+            meta.stats.window_bytes_progressed = 1;
+        }
+
+        sched.tick();
+
+        assert!(
+            sched.is_early_interactive(FlowId(340)),
+            "Time-based exit must NOT fire when total_bytes_submitted == 0"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // tests: QueueTier routing
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// During early-interactive, queue_tier returns Interactive.
+    #[test]
+    fn test_queue_tier_during_early_interactive() {
+        let bps = Arc::new(AtomicU64::new(0));
+        let mut sched = Scheduler::new(bps);
+
+        let hints = FlowHints::default_tcp();
+        let _permit = sched.try_issue_permit(ConnId(0), Some(FlowId(330)), &hints, 1024);
+
+        assert!(sched.is_early_interactive(FlowId(330)));
+        assert_eq!(
+            sched.queue_tier(FlowId(330)),
+            QueueTier::Interactive,
+            "Early-interactive flow must route to Interactive queue"
+        );
+    }
+
+    /// After early-interactive exits, Bulk flow routes to Bulk queue.
+    #[test]
+    fn test_queue_tier_after_early_interactive_exits() {
+        let bps = Arc::new(AtomicU64::new(0));
+        let mut sched = Scheduler::new(bps);
+
+        let hints = FlowHints::default_tcp();
+        let permit = sched.try_issue_permit(ConnId(0), Some(FlowId(331)), &hints, 128 * 1024).unwrap();
+        sched.on_send_complete(permit, 128 * 1024);
+
+        assert!(!sched.is_early_interactive(FlowId(331)));
+        assert_eq!(
+            sched.queue_tier(FlowId(331)),
+            QueueTier::Bulk,
+            "After early-interactive exit, Bulk flow must route to Bulk queue"
+        );
+    }
+
+    /// Control class overrides early-interactive in queue_tier.
+    #[test]
+    fn test_queue_tier_control_overrides_early_interactive() {
+        let bps = Arc::new(AtomicU64::new(0));
+        let mut sched = Scheduler::new(bps);
+
+        // Create a flow with port 53 (DNS) — starts as Bulk with early-interactive.
+        sched.init_flow(FlowId(332), FlowClass::Bulk, Some(53), false);
+
+        // Before reclassify: early-interactive, class=Bulk, port=53.
+        assert!(sched.is_early_interactive(FlowId(332)));
+        assert_eq!(sched.queue_tier(FlowId(332)), QueueTier::Interactive);
+
+        // Simulate tick which reclassifies port 53 to Control.
+        {
+            let meta = sched.flow_meta_mut(FlowId(332)).unwrap();
+            meta.stats.window_bytes_progressed = 1; // prevent idle
+        }
+        sched.tick();
+
+        assert_eq!(
+            sched.flow_class(FlowId(332)),
+            Some(FlowClass::Control),
+            "Port 53 must be reclassified to Control"
+        );
+        // Control overrides early-interactive.
+        assert_eq!(
+            sched.queue_tier(FlowId(332)),
+            QueueTier::Control,
+            "Control class must override early-interactive for queue routing"
+        );
     }
 
 }

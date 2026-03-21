@@ -1,11 +1,14 @@
-/// TcpFlowActor — permit-before-read TCP proxy relay.
+/// TcpFlowActor — pipelined permit-before-read TCP proxy relay.
 ///
 /// Handles one TCP proxy flow within a QUIC connection.
 ///
 /// Upload path (local TCP → QUIC):
-///   1. Acquire a send permit from PermitBank.
-///   2. Read one chunk from the local TCP socket.
-///   3. Write the chunk directly to the QUIC SendStream (no serialization).
+///   Uses double-buffer pipelining: while writing the current chunk to the
+///   QUIC stream, simultaneously acquires the next permit and reads the next
+///   chunk from the local TCP socket. This overlaps the QUIC write with the
+///   permit channel round-trip and TCP read, roughly doubling single-flow
+///   throughput compared to stop-and-wait.
+///
 ///   Each flow owns its own QUIC stream writer, eliminating head-of-line
 ///   blocking between flows. QUIC streams have independent flow control,
 ///   so a slow receiver on one stream cannot block writes to other streams.
@@ -13,14 +16,51 @@
 /// Download path (QUIC recv → local TCP):
 ///   Direct copy. No scheduler needed: the QUIC receive window acts as
 ///   the natural bound and TCP flow control back-pressures the window.
-use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
-use crate::core::connection_actor::ConnControl;
-use crate::core::internal::shard::ConnId;
-use crate::core::scheduler::{FlowHints, FlowId, Scheduler};
+use crate::core::connection_actor::{ConnControl, SendDone};
+use crate::core::scheduler::{FlowHints, FlowId, Permit};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PermitReturnGuard — cancellation-safe permit release via message passing
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Cancel-safe RAII wrapper for a server-side send permit.
+///
+/// Sends a `SendDone` message to `ConnectionActor` on drop via an unbounded
+/// channel, returning the permit credit whether the write succeeded or was
+/// cancelled. Using an unbounded sender guarantees the send never fails —
+/// budget is always returned even if the bounded control channel is full.
+struct PermitReturnGuard {
+    permit: Option<Permit>,
+    completion_tx: mpsc::UnboundedSender<SendDone>,
+    bytes_sent: usize,
+}
+
+impl PermitReturnGuard {
+    fn new(permit: Permit, completion_tx: mpsc::UnboundedSender<SendDone>) -> Self {
+        Self { permit: Some(permit), completion_tx, bytes_sent: 0 }
+    }
+
+    /// Consume the guard with the actual byte count (successful write path).
+    fn complete(mut self, bytes: usize) {
+        self.bytes_sent = bytes;
+        // Drop happens here with bytes_sent set to the actual value.
+    }
+}
+
+impl Drop for PermitReturnGuard {
+    fn drop(&mut self) {
+        if let Some(permit) = self.permit.take() {
+            // Unbounded send never fails: budget is always returned to the actor.
+            let _ = self.completion_tx.send(SendDone {
+                permit,
+                bytes_sent: self.bytes_sent,
+            });
+        }
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // TcpFlowActor
@@ -28,13 +68,12 @@ use crate::core::scheduler::{FlowHints, FlowId, Scheduler};
 
 /// Upload half of a TCP proxy flow.
 ///
-/// Enforces permit-before-read backpressure:
-///   permit acquired → read from local TCP → write directly to QUIC stream
+/// Enforces permit-before-read backpressure via ConnectionActor message passing,
+/// with pipelined double-buffer: while writing the current chunk to QUIC,
+/// acquires the next permit and reads the next chunk from TCP concurrently.
 pub(crate) struct TcpFlowActor<R, QW> {
     /// Unique identifier for this flow within the connection.
     pub flow_id: FlowId,
-    /// Connection identifier — used when requesting permits from PermitBank.
-    pub conn_id: ConnId,
     /// Classification hints for scheduler queue placement and quantum.
     pub hints: FlowHints,
     /// Read half of the local (outbound) TCP connection.
@@ -42,13 +81,11 @@ pub(crate) struct TcpFlowActor<R, QW> {
     /// Write half of the QUIC SendStream — owned exclusively by this actor.
     /// Each flow writes to its own QUIC stream independently, no serialization.
     pub quic_writer: QW,
-    /// Channel to ConnectionActor — only used for FlowClosed notification.
+    /// Channel to ConnectionActor — used for permit requests and FlowClosed notification.
     pub conn_tx: mpsc::Sender<ConnControl>,
-    /// Shared access to the Scheduler's permit bank.
-    ///
-    /// Only `try_issue_permit` and `on_send_complete` are called inside brief
-    /// critical sections.
-    pub scheduler: Arc<StdMutex<Scheduler>>,
+    /// Unbounded channel for permit returns — PermitReturnGuard sends SendDone here on drop.
+    /// Kept separate from conn_tx so budget returns can never be blocked or dropped.
+    pub completion_tx: mpsc::UnboundedSender<SendDone>,
 }
 
 impl<R, QW> TcpFlowActor<R, QW>
@@ -56,66 +93,98 @@ where
     R: AsyncRead + Unpin + Send,
     QW: AsyncWrite + Unpin + Send,
 {
-    /// Upload loop: local TCP → QUIC stream (direct write, no serialization).
+    /// Upload loop: local TCP → QUIC stream (pipelined double-buffer).
     ///
-    /// Permit-before-read: only reads from local socket when a send permit
-    /// is available. Naturally limits in-flight data to the permit budget.
-    /// When the PermitBank is exhausted (QUIC send path saturated), the local
-    /// kernel socket buffer absorbs upstream data and TCP flow control
-    /// back-pressures the upstream sender — no memory bloat.
+    /// Uses two buffers to overlap the QUIC write of the current chunk with
+    /// the permit acquisition and TCP read of the next chunk. While the QUIC
+    /// stream absorbs the current data, the next permit is acquired from
+    /// ConnectionActor and the next chunk is read from the local TCP socket.
+    /// This hides the permit channel round-trip behind the QUIC write,
+    /// roughly doubling single-flow throughput.
     ///
     /// Each flow writes directly to its own QUIC stream. QUIC streams have
     /// independent flow control, so a slow receiver on one stream (e.g., a
     /// 4K video player) cannot block writes to other streams.
-    pub(crate) async fn run(mut self) {
+    pub(crate) async fn run(self) {
         const BUF_SIZE: usize = 32 * 1024;
-        let mut buf = vec![0u8; BUF_SIZE];
+        let mut buf_write = vec![0u8; BUF_SIZE];
+        let mut buf_read = vec![0u8; BUF_SIZE];
+
+        // Destructure self so the borrow checker can see disjoint borrows
+        // in the tokio::join! below (quic_writer vs local_read).
+        let TcpFlowActor {
+            flow_id, hints, mut local_read, mut quic_writer, conn_tx, completion_tx,
+        } = self;
+
+        // Bootstrap: acquire first permit and read first chunk.
+        let permit = match acquire_permit(&conn_tx, flow_id, &hints, BUF_SIZE).await {
+            Some(p) => p,
+            None => {
+                let _ = quic_writer.shutdown().await;
+                let _ = conn_tx.send(ConnControl::FlowClosed(flow_id)).await;
+                return;
+            }
+        };
+        let (mut guard, mut write_len) = match local_read.read(&mut buf_write).await {
+            Ok(0) | Err(_) => {
+                // EOF or read error on first read — return permit and exit.
+                let _ = completion_tx.send(SendDone { permit, bytes_sent: 0 });
+                let _ = quic_writer.shutdown().await;
+                let _ = conn_tx.send(ConnControl::FlowClosed(flow_id)).await;
+                return;
+            }
+            Ok(n) => (PermitReturnGuard::new(permit, completion_tx.clone()), n),
+        };
 
         loop {
-            // Step 1: acquire a permit. Spin with a short sleep when the bank
-            // is exhausted. 1 ms avoids thrashing the Mutex with busy-wait
-            // and is well below human perception threshold.
-            let permit = loop {
-                let maybe = {
-                    let mut sched = self.scheduler.lock().unwrap();
-                    sched.try_issue_permit(self.conn_id, Some(self.flow_id), &self.hints, BUF_SIZE)
-                };
-                if let Some(p) = maybe {
-                    break p;
+            // Pipeline: write current chunk to QUIC while simultaneously
+            // acquiring the next permit and reading into the alternate buffer.
+            let (write_result, prefetch) = tokio::join!(
+                quic_writer.write_all(&buf_write[..write_len]),
+                async {
+                    let p = acquire_permit(&conn_tx, flow_id, &hints, BUF_SIZE).await?;
+                    match local_read.read(&mut buf_read).await {
+                        Ok(0) | Err(_) => {
+                            // EOF or read error — return unused permit.
+                            let _ = completion_tx.send(SendDone {
+                                permit: p,
+                                bytes_sent: 0,
+                            });
+                            None
+                        }
+                        Ok(n) => Some((p, n)),
+                    }
                 }
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            };
+            );
 
-            // Step 2: read from local TCP (credit acquired, safe to read).
-            let n = match self.local_read.read(&mut buf).await {
-                Ok(0) | Err(_) => {
-                    // EOF or error — return the unused permit before closing.
-                    // Without this, every closed flow leaks permit.bytes (32 KiB)
-                    // from the PermitBank. After ~1024 flows the 32 MiB connection
-                    // budget is exhausted and all new permits are denied forever.
-                    self.scheduler.lock().unwrap().on_send_complete(permit, 0);
-                    break;
-                }
-                Ok(n) => n,
-            };
-
-            // Step 3: write directly to the QUIC stream (independent flow control).
-            let sent = match self.quic_writer.write_all(&buf[..n]).await {
-                Ok(()) => n,
+            // Handle current write.
+            match write_result {
+                Ok(()) => guard.complete(write_len),
                 Err(_) => {
-                    // QUIC stream write error — return the permit and exit.
-                    self.scheduler.lock().unwrap().on_send_complete(permit, 0);
+                    // QUIC write failed — return prefetched permit if acquired.
+                    if let Some((p, _)) = prefetch {
+                        let _ = completion_tx.send(SendDone {
+                            permit: p,
+                            bytes_sent: 0,
+                        });
+                    }
                     break;
                 }
-            };
+            }
 
-            // Step 4: return the permit and update stats.
-            self.scheduler.lock().unwrap().on_send_complete(permit, sent);
+            // Advance to next chunk.
+            match prefetch {
+                Some((next_permit, next_len)) => {
+                    guard = PermitReturnGuard::new(next_permit, completion_tx.clone());
+                    write_len = next_len;
+                    std::mem::swap(&mut buf_write, &mut buf_read);
+                }
+                None => break,
+            }
         }
 
-        // Shut down the QUIC stream writer (sends FIN) and notify ConnectionActor.
-        let _ = self.quic_writer.shutdown().await;
-        let _ = self.conn_tx.send(ConnControl::FlowClosed(self.flow_id)).await;
+        let _ = quic_writer.shutdown().await;
+        let _ = conn_tx.send(ConnControl::FlowClosed(flow_id)).await;
     }
 }
 
@@ -154,26 +223,51 @@ where
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// acquire_permit — channel round-trip to ConnectionActor
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Acquire a send permit from ConnectionActor via oneshot round-trip.
+///
+/// Returns `None` if the ConnectionActor is gone (channel closed).
+async fn acquire_permit(
+    conn_tx: &mpsc::Sender<ConnControl>,
+    flow_id: FlowId,
+    hints: &FlowHints,
+    size: usize,
+) -> Option<Permit> {
+    let (result_tx, result_rx) = oneshot::channel::<Permit>();
+    conn_tx
+        .send(ConnControl::AcquirePermit {
+            flow_id,
+            hints: hints.clone(),
+            size,
+            result_tx,
+        })
+        .await
+        .ok()?;
+    result_rx.await.ok()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Convenience spawn helper
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Spawn the upload and download loops for one TCP proxy flow.
 ///
-/// Upload: `local_read` → permit → write directly to `quic_writer`.
+/// Upload: `local_read` → AcquirePermit → write directly to `quic_writer`.
 /// Download: QUIC `quic_recv` → `local_write`.
 ///
 /// Returns the JoinHandles so the caller can `select!` on completion
 /// (when either direction finishes, the other winds down naturally).
 pub(crate) fn spawn_tcp_flow<R, QR, W, QW>(
     flow_id: FlowId,
-    conn_id: ConnId,
     hints: FlowHints,
     local_read: R,
     local_write: W,
     quic_recv: QR,
     quic_writer: QW,
     conn_tx: mpsc::Sender<ConnControl>,
-    scheduler: Arc<StdMutex<Scheduler>>,
+    completion_tx: mpsc::UnboundedSender<SendDone>,
 ) -> (tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>)
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -181,7 +275,14 @@ where
     QR: AsyncRead + Unpin + Send + 'static,
     QW: AsyncWrite + Unpin + Send + 'static,
 {
-    let actor = TcpFlowActor { flow_id, conn_id, hints, local_read, quic_writer, conn_tx, scheduler };
+    let actor = TcpFlowActor {
+        flow_id,
+        hints,
+        local_read,
+        quic_writer,
+        conn_tx,
+        completion_tx,
+    };
 
     let upload = tokio::spawn(async move {
         actor.run().await;

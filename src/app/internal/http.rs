@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE};
+use tokio_util::task::TaskTracker;
 use bytes::Bytes;
 use http::header::{CONNECTION, HOST, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION};
 use http_body_util::combinators::BoxBody;
@@ -48,12 +49,12 @@ pub struct Server {
 }
 
 impl Server {
-    pub async fn serve(self: Arc<Self>, listener: TcpListener) -> io::Result<()> {
+    pub async fn serve(self: Arc<Self>, listener: TcpListener, tracker: TaskTracker) -> io::Result<()> {
         loop {
             let (stream, remote_addr) = listener.accept().await?;
             let remote_addr = unmap_ipv4(remote_addr);
             let server = Arc::clone(&self);
-            tokio::spawn(async move {
+            tracker.spawn(async move {
                 let io = TokioIo::new(stream);
                 let svc = service_fn(move |req| {
                     let server = Arc::clone(&server);

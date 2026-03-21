@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use tokio::net::{TcpListener, TcpStream};
+use tokio_util::task::TaskTracker;
 
 use crate::app::internal::utils::copy_two_way;
 use crate::core::client::ReconnectableClient;
@@ -24,11 +25,11 @@ pub struct TCPRedirect {
 }
 
 impl TCPRedirect {
-    pub async fn listen_and_serve(self: Arc<Self>, listener: TcpListener) -> io::Result<()> {
+    pub async fn listen_and_serve(self: Arc<Self>, listener: TcpListener, tracker: TaskTracker) -> io::Result<()> {
         loop {
             let (conn, _) = listener.accept().await?;
             let this = Arc::clone(&self);
-            tokio::spawn(async move {
+            tracker.spawn(async move {
                 this.handle(conn).await;
             });
         }

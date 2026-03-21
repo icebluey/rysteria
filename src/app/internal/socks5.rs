@@ -6,6 +6,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::watch;
+use tokio_util::task::TaskTracker;
 
 use crate::app::internal::utils::copy_two_way;
 use crate::core::client::ReconnectableClient;
@@ -48,11 +49,11 @@ struct SocksRequest {
 }
 
 impl Server {
-    pub async fn serve(self: Arc<Self>, listener: TcpListener) -> io::Result<()> {
+    pub async fn serve(self: Arc<Self>, listener: TcpListener, tracker: TaskTracker) -> io::Result<()> {
         loop {
             let (conn, _) = listener.accept().await?;
             let server = Arc::clone(&self);
-            tokio::spawn(async move {
+            tracker.spawn(async move {
                 server.dispatch(conn).await;
             });
         }

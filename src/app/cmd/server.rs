@@ -17,11 +17,9 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde::Deserialize;
 use tracing::info;
 
-use crate::app::cmd::{BoxError, parse_bandwidth_bps, read_config_file, resolve_config_path};
+use crate::app::cmd::{BoxError, parse_bandwidth_bps, parse_config, read_config_file, resolve_config_path};
 use crate::core::internal::pmtud::DISABLE_PATH_MTU_DISCOVERY;
-use crate::core::internal::protocol::{
-    DEFAULT_CONN_RECEIVE_WINDOW, DEFAULT_STREAM_RECEIVE_WINDOW, MAX_DATAGRAM_FRAME_SIZE,
-};
+use crate::core::internal::protocol::{DEFAULT_CONN_RECEIVE_WINDOW, DEFAULT_STREAM_RECEIVE_WINDOW};
 use crate::core::server::{EventLogger, RequestHook, Server, ServerConfig, TransportConfigBuilder};
 use crate::extras::auth::{
     Authenticator, CommandAuthenticator, HttpAuthenticator, PasswordAuthenticator,
@@ -435,7 +433,7 @@ pub async fn run_server(config_path: Option<PathBuf>) -> Result<(), BoxError> {
 
     let path = resolve_config_path(config_path)?;
     let raw = read_config_file(&path)?;
-    let file_cfg: ServerConfigFile = serde_saphyr::from_str(&raw)?;
+    let file_cfg: ServerConfigFile = parse_config(&path, &raw)?;
 
     let listen = if file_cfg.listen.trim().is_empty() {
         ":443"
@@ -469,13 +467,21 @@ pub async fn run_server(config_path: Option<PathBuf>) -> Result<(), BoxError> {
         )))
     };
 
+    // Service runtimes: each dedicated single-thread runtime lives until
+    // run_server() returns (after server.serve().await? completes).
+    let mut service_runtimes: Vec<crate::core::internal::runtime::RyRuntime> = Vec::new();
+
     if let Some(ts) = &traffic_logger_server {
         let listen = file_cfg.traffic_stats.listen.clone();
         let ts_clone = Arc::clone(ts);
-        tokio::spawn(async move {
+        let rt = crate::core::internal::runtime::RyRuntime::new_no_steal(
+            "rysteria-traffic-stats",
+        )?;
+        rt.handle().spawn(async move {
             tracing::info!(listen = %listen, "traffic stats server up and running");
             let _ = run_traffic_stats_server(&listen, ts_clone).await;
         });
+        service_runtimes.push(rt);
     }
 
     let request_hook = build_sniffer(&file_cfg.sniff)?;
@@ -572,15 +578,32 @@ pub async fn run_server(config_path: Option<PathBuf>) -> Result<(), BoxError> {
                 force_https: file_cfg.masquerade.force_https,
             });
 
-            tokio::spawn(async move {
+            let masq_rt = crate::core::internal::runtime::RyRuntime::new_no_steal(
+                "rysteria-masq-tcp",
+            )?;
+            masq_rt.handle().spawn(async move {
                 run_masq_tcp_server(tcp_server, http_addr, https_addr).await;
             });
+            service_runtimes.push(masq_rt);
         }
     }
 
     info!(listen = %server.local_addr(), "server up and running");
-    server.serve().await?;
-    Ok(())
+
+    // Run the QUIC accept loop on a dedicated no-steal runtime so that
+    // the connection accept path is pinned to a fixed OS thread, consistent
+    // with the shard-pinned connection pipeline.
+    let quic_rt = crate::core::internal::runtime::RyRuntime::new_no_steal("rysteria-quic-accept")?;
+    let (serve_tx, serve_rx) = tokio::sync::oneshot::channel::<Result<(), BoxError>>();
+    quic_rt.handle().spawn(async move {
+        let _ = serve_tx.send(server.serve().await);
+    });
+    let result = serve_rx
+        .await
+        .unwrap_or_else(|_| Err("QUIC accept runtime exited unexpectedly".into()));
+    drop(service_runtimes);
+    drop(quic_rt);
+    result
 }
 
 fn normalize_listen_addr(listen: &str) -> Result<std::net::SocketAddr, io::Error> {
@@ -1473,8 +1496,9 @@ fn build_server_transport_builder(
     Ok(Arc::new(move || {
         let mut transport = quinn::TransportConfig::default();
         transport.initial_mtu(1200);
-        transport.datagram_receive_buffer_size(Some(MAX_DATAGRAM_FRAME_SIZE as usize));
-        transport.datagram_send_buffer_size(MAX_DATAGRAM_FRAME_SIZE as usize);
+        // Datagram buffer sizes: use Quinn defaults (approx 1.2 MiB receive, 1 MiB send).
+        // Setting these to MAX_DATAGRAM_FRAME_SIZE (1200) confuses per-packet MTU
+        // with transport buffer capacity, silently dropping fragmented UDP messages.
         if disable_pmtud {
             transport.mtu_discovery_config(None);
         }
@@ -1570,5 +1594,100 @@ mod tests {
             ..ServerQuicConfig::default()
         };
         assert!(build_server_transport_builder(&cfg).is_err());
+    }
+
+    #[test]
+    fn toml_server_minimal_config() {
+        let toml = r#"
+listen = "0.0.0.0:443"
+
+[tls]
+cert = "/path/cert.pem"
+key = "/path/key.pem"
+
+[auth]
+type = "password"
+password = "secret"
+"#;
+        let path = std::path::Path::new("server.toml");
+        let cfg: ServerConfigFile = crate::app::cmd::parse_config(path, toml).unwrap();
+        assert_eq!(cfg.listen, "0.0.0.0:443");
+        assert_eq!(cfg.tls.cert, "/path/cert.pem");
+        assert_eq!(cfg.tls.key, "/path/key.pem");
+        assert_eq!(cfg.auth.auth_type, "password");
+        assert_eq!(cfg.auth.password, "secret");
+    }
+
+    #[test]
+    fn toml_server_outbounds_array_of_tables() {
+        let toml = r#"
+listen = ":443"
+
+[[outbounds]]
+name = "direct-1"
+type = "direct"
+
+[outbounds.direct]
+mode = "auto"
+
+[[outbounds]]
+name = "socks-proxy"
+type = "socks5"
+
+[outbounds.socks5]
+addr = "127.0.0.1:1080"
+username = "user"
+password = "pass"
+"#;
+        let path = std::path::Path::new("server.toml");
+        let cfg: ServerConfigFile = crate::app::cmd::parse_config(path, toml).unwrap();
+        assert_eq!(cfg.outbounds.len(), 2);
+        assert_eq!(cfg.outbounds[0].name, "direct-1");
+        assert_eq!(cfg.outbounds[0].outbound_type, "direct");
+        assert_eq!(cfg.outbounds[0].direct.mode, "auto");
+        assert_eq!(cfg.outbounds[1].name, "socks-proxy");
+        assert_eq!(cfg.outbounds[1].socks5.addr, "127.0.0.1:1080");
+    }
+
+    #[test]
+    fn toml_server_auth_userpass_hashmap() {
+        let toml = r#"
+[auth]
+type = "userpass"
+
+[auth.userpass]
+alice = "pass1"
+bob = "pass2"
+"#;
+        let path = std::path::Path::new("server.toml");
+        let cfg: ServerConfigFile = crate::app::cmd::parse_config(path, toml).unwrap();
+        assert_eq!(cfg.auth.auth_type, "userpass");
+        assert_eq!(cfg.auth.userpass.get("alice").unwrap(), "pass1");
+        assert_eq!(cfg.auth.userpass.get("bob").unwrap(), "pass2");
+    }
+
+    #[test]
+    fn toml_server_masquerade_string_headers() {
+        let toml = r#"
+[masquerade]
+type = "string"
+
+[masquerade.string]
+content = "hello"
+statusCode = 200
+
+[masquerade.string.headers]
+content-type = "text/plain"
+x-custom = "value"
+"#;
+        let path = std::path::Path::new("server.toml");
+        let cfg: ServerConfigFile = crate::app::cmd::parse_config(path, toml).unwrap();
+        assert_eq!(cfg.masquerade.masq_type, "string");
+        assert_eq!(cfg.masquerade.string.content, "hello");
+        assert_eq!(cfg.masquerade.string.status_code, 200);
+        assert_eq!(
+            cfg.masquerade.string.headers.get("content-type").unwrap(),
+            "text/plain"
+        );
     }
 }

@@ -15,7 +15,9 @@ use std::io::{self, IoSliceMut};
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::num::ParseIntError;
 use std::pin::Pin;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -192,6 +194,9 @@ struct HopInner {
     recv_rx: std::sync::Mutex<mpsc::Receiver<RecvPacket>>,
     /// Whether the socket has been closed.
     closed: std::sync::atomic::AtomicBool,
+    /// Monotonically increasing hop generation counter.
+    /// Incremented after each successful do_hop(). Starts at 0 (initial socket).
+    generation: Arc<AtomicU64>,
 }
 
 /// A UDP socket that periodically hops to a new local port.
@@ -216,9 +221,18 @@ impl UdpHopSocket {
     /// target addresses derived from the hop address string) and hops every
     /// `hop_interval`.
     ///
+    /// If `external_generation` is `Some`, the provided counter is used as the
+    /// hop generation tracker (test code can observe or target it externally).
+    /// Otherwise an internal counter is created.
+    ///
     /// Binds a fresh local UDP socket and starts background tasks.
-    pub fn new(addrs: Vec<SocketAddr>, hop_interval: Duration) -> io::Result<Self> {
+    pub fn new(
+        addrs: Vec<SocketAddr>,
+        hop_interval: Duration,
+        external_generation: Option<Arc<AtomicU64>>,
+    ) -> io::Result<Self> {
         assert!(!addrs.is_empty(), "addrs must not be empty");
+        let generation = external_generation.unwrap_or_else(|| Arc::new(AtomicU64::new(0)));
         // Choose a random initial target index.
         let addr_index = {
             use rand::RngExt as _;
@@ -252,6 +266,7 @@ impl UdpHopSocket {
             state,
             recv_rx: std::sync::Mutex::new(recv_rx),
             closed: std::sync::atomic::AtomicBool::new(false),
+            generation,
         });
 
         // Start hop task.
@@ -272,6 +287,15 @@ impl UdpHopSocket {
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         let guard = self.inner.state.read().unwrap_or_else(|e| e.into_inner());
         guard.current_socket.local_addr()
+    }
+
+    /// Return a shared handle to the hop generation counter.
+    ///
+    /// The counter starts at 0 (initial socket) and increments by 1 after
+    /// each successful hop. Test code can snapshot the current value and
+    /// use it with generation-aware fault injection.
+    pub fn generation(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.inner.generation)
     }
 }
 
@@ -394,6 +418,9 @@ fn do_hop(inner: &HopInner, recv_tx: &mpsc::Sender<RecvPacket>) {
         state.prev_socket = Some(old_current_socket);
         state.addr_index = new_addr_index;
     }
+
+    // Increment generation after successful rotation.
+    inner.generation.fetch_add(1, Ordering::Relaxed);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -574,7 +601,7 @@ mod tests {
     #[tokio::test]
     async fn hop_socket_creates_and_drops_cleanly() {
         let addrs = resolve_udp_hop_addrs("127.0.0.1:19000-19010").unwrap();
-        let sock = UdpHopSocket::new(addrs, DEFAULT_HOP_INTERVAL).unwrap();
+        let sock = UdpHopSocket::new(addrs, DEFAULT_HOP_INTERVAL, None).unwrap();
         let local = sock.local_addr().unwrap();
         // Should have bound to some ephemeral port.
         assert!(local.port() > 0);

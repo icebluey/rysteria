@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::RwLock;
+use tokio_util::task::TaskTracker;
 use tokio_util::sync::CancellationToken;
 
 use crate::app::internal::utils::copy_two_way;
@@ -35,11 +36,11 @@ pub struct TCPTunnel {
 }
 
 impl TCPTunnel {
-    pub async fn serve(self: Arc<Self>, listener: TcpListener) -> io::Result<()> {
+    pub async fn serve(self: Arc<Self>, listener: TcpListener, tracker: TaskTracker) -> io::Result<()> {
         loop {
             let (conn, _) = listener.accept().await?;
             let tunnel = Arc::clone(&self);
-            tokio::spawn(async move {
+            tracker.spawn(async move {
                 tunnel.handle(conn).await;
             });
         }
@@ -109,7 +110,7 @@ impl UDPTunnel {
         }
     }
 
-    pub async fn serve(self: Arc<Self>, socket: UdpSocket) -> io::Result<()> {
+    pub async fn serve(self: Arc<Self>, socket: UdpSocket, tracker: TaskTracker) -> io::Result<()> {
         let socket = Arc::new(socket);
         let cancel = CancellationToken::new();
 
@@ -124,7 +125,7 @@ impl UDPTunnel {
             loop {
                 let (n, addr) = socket.recv_from(&mut buf).await?;
                 let data = buf[..n].to_vec();
-                self.feed(Arc::clone(&socket), addr, data).await;
+                self.feed(Arc::clone(&socket), addr, data, &tracker).await;
             }
             #[allow(unreachable_code)]
             Ok::<(), io::Error>(())
@@ -173,7 +174,7 @@ impl UDPTunnel {
         }
     }
 
-    async fn feed(self: &Arc<Self>, socket: Arc<UdpSocket>, addr: SocketAddr, data: Vec<u8>) {
+    async fn feed(self: &Arc<Self>, socket: Arc<UdpSocket>, addr: SocketAddr, data: Vec<u8>, tracker: &TaskTracker) {
         let mut created = false;
         let entry = if let Some(existing) = self.sessions.read().await.get(&addr).cloned() {
             existing
@@ -210,7 +211,7 @@ impl UDPTunnel {
             let tunnel = Arc::clone(self);
             let socket = Arc::clone(&socket);
             let entry_for_loop = Arc::clone(&entry);
-            tokio::spawn(async move {
+            tracker.spawn(async move {
                 tunnel
                     .session_receive_loop(socket, addr, entry_for_loop)
                     .await;

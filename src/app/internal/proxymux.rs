@@ -4,6 +4,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use tokio::net::{TcpListener, TcpStream};
+use tokio_util::task::TaskTracker;
 
 pub type DispatchHandler =
     Arc<dyn Fn(TcpStream) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
@@ -15,12 +16,13 @@ pub async fn serve(
     listener: TcpListener,
     socks_handler: DispatchHandler,
     http_handler: DispatchHandler,
+    tracker: TaskTracker,
 ) -> io::Result<()> {
     loop {
         let (stream, _) = listener.accept().await?;
         let socks_handler = Arc::clone(&socks_handler);
         let http_handler = Arc::clone(&http_handler);
-        tokio::spawn(async move {
+        tracker.spawn(async move {
             let mut first = [0u8; 1];
             let n = match stream.peek(&mut first).await {
                 Ok(n) => n,

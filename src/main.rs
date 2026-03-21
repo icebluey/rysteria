@@ -2,10 +2,9 @@ use std::io;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use time::OffsetDateTime;
-use time::format_description::well_known::Rfc3339;
 use tracing::field::{Field, Visit};
 use tracing::{Event, Level, Subscriber};
 use tracing_subscriber::EnvFilter;
@@ -61,7 +60,7 @@ struct Cli {
 enum Commands {
     #[command(about = "Start proxy server (reads config file)")]
     Server,
-    #[command(about = "Start proxy client (default if no subcommand given; reads config file)")]
+    #[command(about = "Start proxy client (reads config file)")]
     Client,
     #[command(about = "TCP ping to <addr> through the proxy server")]
     Ping { addr: String },
@@ -129,7 +128,11 @@ async fn main() {
 
     let result = match cli.command {
         Some(Commands::Server) => cmd::server::run_server(cli.config).await,
-        Some(Commands::Client) | None => cmd::client::run_client(cli.config).await,
+        Some(Commands::Client) => cmd::client::run_client(cli.config).await,
+        None => {
+            Cli::command().print_help().ok();
+            std::process::exit(0);
+        }
         Some(Commands::Ping { addr }) => cmd::client::run_ping(cli.config, addr).await,
         Some(Commands::Speedtest {
             skip_download,
@@ -280,9 +283,17 @@ where
         collector.strip_internal_log_fields();
         let msg = collector.take_message();
 
-        let time = OffsetDateTime::now_utc()
-            .format(&Rfc3339)
-            .unwrap_or_else(|_| "unknown".to_string());
+        let now = OffsetDateTime::now_utc();
+        let time = format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+            now.year(),
+            now.month() as u8,
+            now.day(),
+            now.hour(),
+            now.minute(),
+            now.second(),
+            now.millisecond(),
+        );
         let level = color_level(event.metadata().level());
 
         if collector.fields.is_empty() {

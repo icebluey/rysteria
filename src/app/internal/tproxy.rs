@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{RwLock, mpsc};
+use tokio_util::task::TaskTracker;
 
 use crate::app::internal::utils::copy_two_way;
 use crate::core::client::{HyUdpConn, ReconnectableClient};
@@ -44,11 +45,11 @@ pub struct TCPTProxy {
 }
 
 impl TCPTProxy {
-    pub async fn listen_and_serve(self: Arc<Self>, listener: TcpListener) -> io::Result<()> {
+    pub async fn listen_and_serve(self: Arc<Self>, listener: TcpListener, tracker: TaskTracker) -> io::Result<()> {
         loop {
             let (conn, _) = listener.accept().await?;
             let this = Arc::clone(&self);
-            tokio::spawn(async move {
+            tracker.spawn(async move {
                 this.handle(conn).await;
             });
         }
@@ -192,7 +193,7 @@ impl UDPTProxy {
         }
     }
 
-    pub async fn listen_and_serve(self: Arc<Self>, socket: UdpSocket) -> io::Result<()> {
+    pub async fn listen_and_serve(self: Arc<Self>, socket: UdpSocket, tracker: TaskTracker) -> io::Result<()> {
         let socket = Arc::new(socket);
         #[cfg(target_os = "linux")]
         enable_original_dst_recv(&socket)?;
@@ -201,7 +202,7 @@ impl UDPTProxy {
         loop {
             let (n, src_addr, req_addr) = recv_with_req_addr(&socket, &mut buf).await?;
             let packet = buf[..n].to_vec();
-            self.feed(Arc::clone(&socket), src_addr, req_addr, packet)
+            self.feed(Arc::clone(&socket), src_addr, req_addr, packet, &tracker)
                 .await;
         }
     }
@@ -212,6 +213,7 @@ impl UDPTProxy {
         src_addr: SocketAddr,
         req_addr: SocketAddr,
         data: Vec<u8>,
+        tracker: &TaskTracker,
     ) {
         let key = UdpPairKey { src_addr, req_addr };
         let pair = if let Some(existing) = self.pairs.read().await.get(&key).cloned() {
@@ -245,7 +247,7 @@ impl UDPTProxy {
                 let this = Arc::clone(self);
                 let socket_clone = Arc::clone(&socket);
                 let pair_clone = Arc::clone(&pair);
-                tokio::spawn(async move {
+                tracker.spawn(async move {
                     this.pair_loop(socket_clone, key, pair_clone, send_rx).await;
                 });
                 pair

@@ -86,6 +86,8 @@ fn client_cfg(password: &str, server_addr: std::net::SocketAddr) -> ClientConfig
         persistent_tunnel: true,
         tunnel_keepalive_secs: 25,
         conn_send_budget: None,
+        socket_wrapper: None,
+        hop_generation: None,
     }
 }
 

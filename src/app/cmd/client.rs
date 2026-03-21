@@ -11,8 +11,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
+use tokio_util::task::TaskTracker;
 
-use crate::app::cmd::{BoxError, parse_bandwidth_bps, read_config_file, resolve_config_path};
+use crate::app::cmd::{BoxError, parse_bandwidth_bps, parse_config, read_config_file, resolve_config_path};
 use crate::app::internal::forwarding::{TCPTunnel, UDPTunnel};
 use crate::app::internal::proxymux;
 use crate::app::internal::sockopts::{SocketOptions, UnsupportedError};
@@ -23,9 +24,7 @@ use crate::core::client::{
     HandshakeInfo, ReconnectableClient, UdpSocketFactory,
 };
 use crate::core::internal::pmtud::DISABLE_PATH_MTU_DISCOVERY;
-use crate::core::internal::protocol::{
-    DEFAULT_CONN_RECEIVE_WINDOW, DEFAULT_STREAM_RECEIVE_WINDOW, MAX_DATAGRAM_FRAME_SIZE,
-};
+use crate::core::internal::protocol::{DEFAULT_CONN_RECEIVE_WINDOW, DEFAULT_STREAM_RECEIVE_WINDOW};
 use crate::extras::transport::udphop::{
     DEFAULT_HOP_INTERVAL, MIN_HOP_INTERVAL, resolve_udp_hop_addrs,
 };
@@ -307,10 +306,13 @@ pub async fn run_client(config_path: Option<PathBuf>) -> Result<(), BoxError> {
 
     let path = resolve_config_path(config_path)?;
     let raw = read_config_file(&path)?;
-    let cfg: ClientConfigFile = serde_saphyr::from_str(&raw)?;
+    let cfg: ClientConfigFile = parse_config(&path, &raw)?;
 
     let shared_cfg = Arc::new(cfg.clone());
     let config_func_cfg = Arc::clone(&shared_cfg);
+    let tunnel_rt = crate::core::internal::runtime::RyRuntime::new_no_steal(
+        "rysteria-tunnel-keepalive",
+    )?;
     let client = Arc::new(
         ReconnectableClient::new(
             move || build_client_config(&config_func_cfg),
@@ -323,10 +325,24 @@ pub async fn run_client(config_path: Option<PathBuf>) -> Result<(), BoxError> {
                 );
             }),
             cfg.lazy,
+            Some(tunnel_rt.handle().clone()),
         )
         .await?,
     );
 
+    // Dedicated runtime for all client entry services (SOCKS5, HTTP, forwarding,
+    // TProxy, TUN). Isolates entry service I/O from the main runtime and the
+    // tunnel keepalive runtime, matching server-side service partitioning.
+    let entry_threads = std::thread::available_parallelism()
+        .map(|n| n.get().min(4))
+        .unwrap_or(2);
+    let entry_rt = crate::core::internal::runtime::RyRuntime::new_multi_thread(
+        "rysteria-entry-svc",
+        entry_threads,
+    )?;
+    let entry = entry_rt.handle().clone();
+
+    let entry_tracker = TaskTracker::new();
     let mut modes = Vec::<(String, tokio::task::JoinHandle<Result<(), BoxError>>)>::new();
 
     if let (Some(socks_cfg), Some(http_cfg)) = (&cfg.socks5, &cfg.http) {
@@ -334,38 +350,43 @@ pub async fn run_client(config_path: Option<PathBuf>) -> Result<(), BoxError> {
             let c = Arc::clone(&client);
             let socks_cfg = socks_cfg.clone();
             let http_cfg = http_cfg.clone();
+            let t = entry_tracker.clone();
             modes.push((
                 "Proxy mux".to_string(),
-                tokio::spawn(async move { run_mux_mode(socks_cfg, http_cfg, c).await }),
+                entry.spawn(async move { run_mux_mode(socks_cfg, http_cfg, c, t).await }),
             ));
         } else {
             let c = Arc::clone(&client);
             let s = socks_cfg.clone();
+            let t = entry_tracker.clone();
             modes.push((
                 "SOCKS5 server".to_string(),
-                tokio::spawn(async move { run_socks5(s, c).await }),
+                entry.spawn(async move { run_socks5(s, c, t).await }),
             ));
 
             let c = Arc::clone(&client);
             let h = http_cfg.clone();
+            let t = entry_tracker.clone();
             modes.push((
                 "HTTP proxy server".to_string(),
-                tokio::spawn(async move { run_http(h, c).await }),
+                entry.spawn(async move { run_http(h, c, t).await }),
             ));
         }
     } else {
         if let Some(socks_cfg) = cfg.socks5.clone() {
             let c = Arc::clone(&client);
+            let t = entry_tracker.clone();
             modes.push((
                 "SOCKS5 server".to_string(),
-                tokio::spawn(async move { run_socks5(socks_cfg, c).await }),
+                entry.spawn(async move { run_socks5(socks_cfg, c, t).await }),
             ));
         }
         if let Some(http_cfg) = cfg.http.clone() {
             let c = Arc::clone(&client);
+            let t = entry_tracker.clone();
             modes.push((
                 "HTTP proxy server".to_string(),
-                tokio::spawn(async move { run_http(http_cfg, c).await }),
+                entry.spawn(async move { run_http(http_cfg, c, t).await }),
             ));
         }
     }
@@ -373,18 +394,20 @@ pub async fn run_client(config_path: Option<PathBuf>) -> Result<(), BoxError> {
     if !cfg.tcp_forwarding.is_empty() {
         let c = Arc::clone(&client);
         let entries = cfg.tcp_forwarding.clone();
+        let t = entry_tracker.clone();
         modes.push((
             "TCP forwarding".to_string(),
-            tokio::spawn(async move { run_tcp_forwarding(entries, c).await }),
+            entry.spawn(async move { run_tcp_forwarding(entries, c, t).await }),
         ));
     }
 
     if !cfg.udp_forwarding.is_empty() {
         let c = Arc::clone(&client);
         let entries = cfg.udp_forwarding.clone();
+        let t = entry_tracker.clone();
         modes.push((
             "UDP forwarding".to_string(),
-            tokio::spawn(async move { run_udp_forwarding(entries, c).await }),
+            entry.spawn(async move { run_udp_forwarding(entries, c, t).await }),
         ));
     }
 
@@ -395,9 +418,10 @@ pub async fn run_client(config_path: Option<PathBuf>) -> Result<(), BoxError> {
             );
         }
         let c = Arc::clone(&client);
+        let t = entry_tracker.clone();
         modes.push((
             "TCP transparent proxy".to_string(),
-            tokio::spawn(async move { run_tcp_tproxy(tp, c).await }),
+            entry.spawn(async move { run_tcp_tproxy(tp, c, t).await }),
         ));
     }
 
@@ -408,9 +432,10 @@ pub async fn run_client(config_path: Option<PathBuf>) -> Result<(), BoxError> {
             );
         }
         let c = Arc::clone(&client);
+        let t = entry_tracker.clone();
         modes.push((
             "UDP transparent proxy".to_string(),
-            tokio::spawn(async move { run_udp_tproxy(up, c).await }),
+            entry.spawn(async move { run_udp_tproxy(up, c, t).await }),
         ));
     }
 
@@ -421,9 +446,10 @@ pub async fn run_client(config_path: Option<PathBuf>) -> Result<(), BoxError> {
             );
         }
         let c = Arc::clone(&client);
+        let t = entry_tracker.clone();
         modes.push((
             "TCP redirect".to_string(),
-            tokio::spawn(async move { run_tcp_redirect(rd, c).await }),
+            entry.spawn(async move { run_tcp_redirect(rd, c, t).await }),
         ));
     }
 
@@ -432,15 +458,19 @@ pub async fn run_client(config_path: Option<PathBuf>) -> Result<(), BoxError> {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "tun.name is empty").into());
         }
         let c = Arc::clone(&client);
+        let t = entry_tracker.clone();
         modes.push((
             "TUN".to_string(),
-            tokio::spawn(async move { run_tun(tun_cfg, c).await }),
+            entry.spawn(async move { run_tun(tun_cfg, c, t).await }),
         ));
     }
 
     if modes.is_empty() {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "no mode specified").into());
     }
+
+    // Collect abort handles so we can stop accept loops on shutdown.
+    let abort_handles: Vec<_> = modes.iter().map(|(_, h)| h.abort_handle()).collect();
 
     let (tx, mut rx) = mpsc::channel::<(String, Result<(), BoxError>)>(modes.len());
     for (name, handle) in modes {
@@ -455,10 +485,40 @@ pub async fn run_client(config_path: Option<PathBuf>) -> Result<(), BoxError> {
     }
     drop(tx);
 
+    const DRAIN_TIMEOUT_SECS: u64 = 2;
+
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             info!("received signal, shutting down gracefully");
-            let _ = client.close().await;
+            // Spawn force-exit handler for second signal.
+            tokio::spawn(async {
+                let _ = tokio::signal::ctrl_c().await;
+                info!("received second signal, forcing exit");
+                std::process::exit(1);
+            });
+
+            // Stop entry service accept loops.
+            for h in &abort_handles {
+                h.abort();
+            }
+            entry_tracker.close();
+
+            // Reject new requests and stop keepalive/reconnect.
+            client.begin_shutdown().await;
+
+            // Wait for both entry handlers and tunnel work to drain.
+            let drain = async {
+                tokio::join!(
+                    entry_tracker.wait(),
+                    client.wait_tunnel_drain(),
+                )
+            };
+            if tokio::time::timeout(Duration::from_secs(DRAIN_TIMEOUT_SECS), drain).await.is_err() {
+                warn!("client drain timeout, forcing shutdown");
+            }
+
+            // Force close QUIC.
+            client.force_close().await;
             Ok(())
         }
         msg = rx.recv() => {
@@ -482,7 +542,7 @@ pub async fn run_ping(config_path: Option<PathBuf>, addr: String) -> Result<(), 
 
     let path = resolve_config_path(config_path)?;
     let raw = read_config_file(&path)?;
-    let cfg: ClientConfigFile = serde_saphyr::from_str(&raw)?;
+    let cfg: ClientConfigFile = parse_config(&path, &raw)?;
     let core_cfg = build_client_config(&Arc::new(cfg))?;
 
     let (client, info0) = Client::connect(core_cfg).await?;
@@ -509,7 +569,7 @@ pub async fn run_speedtest(
 
     let path = resolve_config_path(config_path)?;
     let raw = read_config_file(&path)?;
-    let cfg: ClientConfigFile = serde_saphyr::from_str(&raw)?;
+    let cfg: ClientConfigFile = parse_config(&path, &raw)?;
     let core_cfg = build_client_config(&Arc::new(cfg))?;
 
     let (client, info0) = Client::connect(core_cfg).await?;
@@ -587,6 +647,8 @@ fn build_client_config(cfg: &Arc<ClientConfigFile>) -> Result<ClientConfig, BoxE
         persistent_tunnel: true,
         tunnel_keepalive_secs: 25,
         conn_send_budget: None,
+        socket_wrapper: None,
+        hop_generation: None,
     })
 }
 
@@ -626,8 +688,9 @@ fn build_client_transport_config(
 
     let mut transport = quinn::TransportConfig::default();
     transport.initial_mtu(1200);
-    transport.datagram_receive_buffer_size(Some(MAX_DATAGRAM_FRAME_SIZE as usize));
-    transport.datagram_send_buffer_size(MAX_DATAGRAM_FRAME_SIZE as usize);
+    // Datagram buffer sizes: use Quinn defaults (approx 1.2 MiB receive, 1 MiB send).
+    // Setting these to MAX_DATAGRAM_FRAME_SIZE (1200) confuses per-packet MTU
+    // with transport buffer capacity, silently dropping fragmented UDP messages.
     if cfg.disable_path_mtu_discovery || DISABLE_PATH_MTU_DISCOVERY {
         transport.mtu_discovery_config(None);
     }
@@ -1394,6 +1457,7 @@ async fn run_mux_mode(
     socks_cfg: Socks5Config,
     http_cfg: HttpConfig,
     client: Arc<ReconnectableClient>,
+    tracker: TaskTracker,
 ) -> Result<(), BoxError> {
     if socks_cfg.listen.trim().is_empty() {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "socks5.listen is empty").into());
@@ -1436,13 +1500,14 @@ async fn run_mux_mode(
         })
     });
 
-    proxymux::serve(listener, socks_handler, http_handler).await?;
+    proxymux::serve(listener, socks_handler, http_handler, tracker).await?;
     Ok(())
 }
 
 async fn run_socks5(
     config: Socks5Config,
     client: Arc<ReconnectableClient>,
+    tracker: TaskTracker,
 ) -> Result<(), BoxError> {
     if config.listen.trim().is_empty() {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "socks5.listen is empty").into());
@@ -1457,11 +1522,11 @@ async fn run_socks5(
     });
 
     info!(addr = %config.listen, "SOCKS5 server listening");
-    server.serve(listener).await?;
+    server.serve(listener, tracker).await?;
     Ok(())
 }
 
-async fn run_http(config: HttpConfig, client: Arc<ReconnectableClient>) -> Result<(), BoxError> {
+async fn run_http(config: HttpConfig, client: Arc<ReconnectableClient>, tracker: TaskTracker) -> Result<(), BoxError> {
     if config.listen.trim().is_empty() {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "http.listen is empty").into());
     }
@@ -1479,13 +1544,14 @@ async fn run_http(config: HttpConfig, client: Arc<ReconnectableClient>) -> Resul
     });
 
     info!(addr = %config.listen, "HTTP proxy server listening");
-    server.serve(listener).await?;
+    server.serve(listener, tracker).await?;
     Ok(())
 }
 
 async fn run_tcp_forwarding(
     entries: Vec<TcpForwardingEntry>,
     client: Arc<ReconnectableClient>,
+    tracker: TaskTracker,
 ) -> Result<(), BoxError> {
     let (tx, mut rx) = mpsc::channel::<Result<(), BoxError>>(entries.len());
 
@@ -1515,9 +1581,10 @@ async fn run_tcp_forwarding(
         });
 
         let tx = tx.clone();
-        tokio::spawn(async move {
+        let fwd_tracker = tracker.clone();
+        tracker.spawn(async move {
             let result = tunnel
-                .serve(listener)
+                .serve(listener, fwd_tracker)
                 .await
                 .map_err(|err| Box::new(err) as BoxError);
             let _ = tx.send(result).await;
@@ -1531,6 +1598,7 @@ async fn run_tcp_forwarding(
 async fn run_udp_forwarding(
     entries: Vec<UdpForwardingEntry>,
     client: Arc<ReconnectableClient>,
+    tracker: TaskTracker,
 ) -> Result<(), BoxError> {
     let (tx, mut rx) = mpsc::channel::<Result<(), BoxError>>(entries.len());
 
@@ -1561,9 +1629,10 @@ async fn run_udp_forwarding(
         ));
 
         let tx = tx.clone();
-        tokio::spawn(async move {
+        let fwd_tracker = tracker.clone();
+        tracker.spawn(async move {
             let result = tunnel
-                .serve(socket)
+                .serve(socket, fwd_tracker)
                 .await
                 .map_err(|err| Box::new(err) as BoxError);
             let _ = tx.send(result).await;
@@ -1577,6 +1646,7 @@ async fn run_udp_forwarding(
 async fn run_tcp_tproxy(
     config: TcpTProxyConfig,
     client: Arc<ReconnectableClient>,
+    tracker: TaskTracker,
 ) -> Result<(), BoxError> {
     if !cfg!(target_os = "linux") {
         return Err(io::Error::new(
@@ -1591,13 +1661,14 @@ async fn run_tcp_tproxy(
         event_logger: Some(Arc::new(TcpTProxyLogger)),
     });
     info!(addr = %config.listen, "TCP transparent proxy listening");
-    proxy.listen_and_serve(listener).await?;
+    proxy.listen_and_serve(listener, tracker).await?;
     Ok(())
 }
 
 async fn run_udp_tproxy(
     config: UdpTProxyConfig,
     client: Arc<ReconnectableClient>,
+    tracker: TaskTracker,
 ) -> Result<(), BoxError> {
     if !cfg!(target_os = "linux") {
         return Err(io::Error::new(
@@ -1613,13 +1684,14 @@ async fn run_udp_tproxy(
         Some(Arc::new(UdpTProxyLogger)),
     ));
     info!(addr = %config.listen, "UDP transparent proxy listening");
-    proxy.listen_and_serve(socket).await?;
+    proxy.listen_and_serve(socket, tracker).await?;
     Ok(())
 }
 
 async fn run_tcp_redirect(
     config: TcpRedirectConfig,
     client: Arc<ReconnectableClient>,
+    tracker: TaskTracker,
 ) -> Result<(), BoxError> {
     if !cfg!(target_os = "linux") {
         return Err(io::Error::new(
@@ -1634,11 +1706,11 @@ async fn run_tcp_redirect(
         event_logger: Some(Arc::new(TcpRedirectLogger)),
     });
     info!(addr = %config.listen, "TCP redirect listening");
-    server.listen_and_serve(listener).await?;
+    server.listen_and_serve(listener, tracker).await?;
     Ok(())
 }
 
-async fn run_tun(config: TunModeConfig, client: Arc<ReconnectableClient>) -> Result<(), BoxError> {
+async fn run_tun(config: TunModeConfig, client: Arc<ReconnectableClient>, tracker: TaskTracker) -> Result<(), BoxError> {
     let mut server_cfg = tun::TunConfig {
         name: if config.name.trim().is_empty() {
             "hytun".to_string()
@@ -1683,7 +1755,7 @@ async fn run_tun(config: TunModeConfig, client: Arc<ReconnectableClient>) -> Res
     let server = tun::build_default_tun_server(client, server_cfg, Some(Arc::new(TunLogger)));
     server.validate()?;
     info!(interface = %server.config.name, "TUN listening");
-    server.serve().await?;
+    server.serve(tracker).await?;
     Ok(())
 }
 
@@ -1961,5 +2033,134 @@ mod tests {
             ..ClientQuicConfig::default()
         };
         assert!(build_client_transport_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn toml_client_minimal_config() {
+        let toml = r#"
+server = "example.com:443"
+auth = "my-secret"
+
+[bandwidth]
+up = "100 mbps"
+down = "500 mbps"
+"#;
+        let path = std::path::Path::new("client.toml");
+        let cfg: ClientConfigFile = crate::app::cmd::parse_config(path, toml).unwrap();
+        assert_eq!(cfg.server, "example.com:443");
+        assert_eq!(cfg.auth, "my-secret");
+        assert_eq!(cfg.bandwidth.up, "100 mbps");
+        assert_eq!(cfg.bandwidth.down, "500 mbps");
+    }
+
+    #[test]
+    fn toml_client_forwarding_array_of_tables() {
+        let toml = r#"
+server = "example.com:443"
+
+[[tcpForwarding]]
+listen = "127.0.0.1:8080"
+remote = "internal:80"
+
+[[tcpForwarding]]
+listen = "127.0.0.1:8443"
+remote = "internal:443"
+
+[[udpForwarding]]
+listen = "127.0.0.1:5353"
+remote = "8.8.8.8:53"
+timeout = "30s"
+"#;
+        let path = std::path::Path::new("client.toml");
+        let cfg: ClientConfigFile = crate::app::cmd::parse_config(path, toml).unwrap();
+        assert_eq!(cfg.tcp_forwarding.len(), 2);
+        assert_eq!(cfg.tcp_forwarding[0].listen, "127.0.0.1:8080");
+        assert_eq!(cfg.tcp_forwarding[0].remote, "internal:80");
+        assert_eq!(cfg.tcp_forwarding[1].listen, "127.0.0.1:8443");
+        assert_eq!(cfg.tcp_forwarding[1].remote, "internal:443");
+        assert_eq!(cfg.udp_forwarding.len(), 1);
+        assert_eq!(cfg.udp_forwarding[0].listen, "127.0.0.1:5353");
+        assert_eq!(cfg.udp_forwarding[0].remote, "8.8.8.8:53");
+        assert_eq!(cfg.udp_forwarding[0].timeout, Some(Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn toml_client_duration_as_integer() {
+        let toml = r#"
+server = "example.com:443"
+
+[quic]
+maxIdleTimeout = 120
+keepAlivePeriod = 15
+"#;
+        let path = std::path::Path::new("client.toml");
+        let cfg: ClientConfigFile = crate::app::cmd::parse_config(path, toml).unwrap();
+        assert_eq!(cfg.quic.max_idle_timeout, Some(Duration::from_secs(120)));
+        assert_eq!(cfg.quic.keep_alive_period, Some(Duration::from_secs(15)));
+    }
+
+    #[test]
+    fn toml_client_duration_as_string() {
+        let toml = r#"
+server = "example.com:443"
+
+[quic]
+maxIdleTimeout = "2m"
+keepAlivePeriod = "10s"
+"#;
+        let path = std::path::Path::new("client.toml");
+        let cfg: ClientConfigFile = crate::app::cmd::parse_config(path, toml).unwrap();
+        assert_eq!(cfg.quic.max_idle_timeout, Some(Duration::from_secs(120)));
+        assert_eq!(cfg.quic.keep_alive_period, Some(Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn toml_yaml_client_produce_same_result() {
+        let toml_raw = r#"
+server = "example.com:443"
+auth = "token"
+fastOpen = true
+
+[bandwidth]
+up = "100 mbps"
+down = "500 mbps"
+
+[socks5]
+listen = "127.0.0.1:1080"
+
+[[tcpForwarding]]
+listen = "127.0.0.1:8080"
+remote = "internal:80"
+"#;
+        let yaml_raw = r#"
+server: "example.com:443"
+auth: "token"
+fastOpen: true
+
+bandwidth:
+  up: "100 mbps"
+  down: "500 mbps"
+
+socks5:
+  listen: "127.0.0.1:1080"
+
+tcpForwarding:
+  - listen: "127.0.0.1:8080"
+    remote: "internal:80"
+"#;
+        let from_toml: ClientConfigFile =
+            crate::app::cmd::parse_config(std::path::Path::new("c.toml"), toml_raw).unwrap();
+        let from_yaml: ClientConfigFile =
+            crate::app::cmd::parse_config(std::path::Path::new("c.yaml"), yaml_raw).unwrap();
+
+        assert_eq!(from_toml.server, from_yaml.server);
+        assert_eq!(from_toml.auth, from_yaml.auth);
+        assert_eq!(from_toml.fast_open, from_yaml.fast_open);
+        assert_eq!(from_toml.bandwidth.up, from_yaml.bandwidth.up);
+        assert_eq!(from_toml.bandwidth.down, from_yaml.bandwidth.down);
+        assert_eq!(from_toml.socks5.as_ref().unwrap().listen, from_yaml.socks5.as_ref().unwrap().listen);
+        assert_eq!(from_toml.tcp_forwarding.len(), from_yaml.tcp_forwarding.len());
+        assert_eq!(from_toml.tcp_forwarding[0].listen, from_yaml.tcp_forwarding[0].listen);
+        assert_eq!(from_toml.tcp_forwarding[0].remote, from_yaml.tcp_forwarding[0].remote);
     }
 }
